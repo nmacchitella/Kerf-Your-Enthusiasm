@@ -7,7 +7,6 @@ import { UserMenu } from '@/components/auth/UserMenu';
 
 const publicNavItems = [
   { href: '/cut-list', label: 'Cut List' },
-  { href: '/tools', label: 'Tools' },
   { href: '/calculators', label: 'Calculators' },
 ];
 
