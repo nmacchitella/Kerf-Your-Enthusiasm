@@ -29,12 +29,13 @@ export const accounts = sqliteTable('accounts', {
   id: text('id').primaryKey(),
   userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   providerId: text('provider_id').notNull(),
-  providerAccountId: text('provider_account_id').notNull(),
+  accountId: text('account_id').notNull(),
   accessToken: text('access_token'),
   refreshToken: text('refresh_token'),
   expiresAt: integer('expires_at', { mode: 'timestamp' }),
   tokenType: text('token_type'),
   scope: text('scope'),
+  idToken: text('id_token'),
 });
 
 export const verifications = sqliteTable('verifications', {

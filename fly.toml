@@ -5,6 +5,7 @@ primary_region = "iad"
 
 [env]
   NODE_ENV = "production"
+  DATABASE_PATH = "/data/app.db"
 
 [http_service]
   internal_port = 3000
@@ -14,7 +15,15 @@ primary_region = "iad"
   min_machines_running = 0
   processes = ["app"]
 
+[mounts]
+  source = "data"
+  destination = "/data"
+
 [[vm]]
   memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
+
+# Single instance for SQLite
+[deploy]
+  strategy = "immediate"
