@@ -4,6 +4,7 @@ export interface Stock {
   name: string;
   l: number;  // length in inches
   w: number;  // width in inches
+  qty: number; // quantity available
   mat: string;
 }
 
