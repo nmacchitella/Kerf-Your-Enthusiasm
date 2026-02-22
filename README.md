@@ -1,105 +1,70 @@
-# Kerf-Your-Enthusiasm
+# Kerf Your Enthusiasm
 
-A woodworking toolkit for planning projects, optimizing lumber cuts, and performing shop math. Minimize waste, maximize efficiency.
+> **kerf** /kərf/ *noun* — the slit made by a saw or cutting tool.
 
-> **kerf** /kərf/ *noun* - the slit made by a saw or cutting tool
+Yes, it's a pun. No, I'm not sorry.
 
-## Features
+I like to build things — apps, but also actual things. Furniture, shelves, the occasional cutting board nobody asked for. Kerf Your Enthusiasm is a woodworking toolkit that helps with the annoying math that *should* be easy for someone with an MSc in Applied Math, but gets surprisingly complicated when you grow up metric and suddenly have to deal with imperial fractions. Also, when you're moving lumber around and covered in sawdust, you start doubting your own brain. This app is that second opinion.
 
-### Cut List Optimizer
+## What It Does
 
-The flagship feature - an intelligent lumber cutting optimizer that minimizes material waste.
+**Cut List Optimizer** — the main thing. You tell it what lumber you have and what pieces you need, and it figures out how to cut everything with the least waste. It accounts for blade kerf (the material the saw eats), tries multiple algorithms (guillotine packing, shelf packing, branch & bound), and picks the best layout. You get a visual SVG of where every cut goes, and you can export to PDF, CSV, or SVG to bring to the shop.
 
-- **Stock Management** - Define available lumber with presets (4×8 Plywood, Baltic Birch, etc.) or custom dimensions
-- **Parts List** - Specify pieces you need with labels, dimensions, and quantities
-- **Blade Kerf Settings** - Account for material loss from saw blade width (1/16" to 5/32")
-- **Material Matching** - Optionally constrain cuts to specific stock materials
-- **Visual Layout** - Real-time SVG visualization of optimized cut patterns
-- **Multiple Algorithms** - Guillotine, Shelf Packing, and Branch & Bound optimization
-- **Export Options** - PDF, CSV, and SVG export for the shop
+**Calculators** — a suite of 8 little tools for shop math: board feet, fraction arithmetic, golden ratio, angles & slopes, shelf spacing, taper jig angles, a fraction reference chart, and wood movement estimation. Nothing fancy, but exactly the kind of thing you need mid-project when your brain stops cooperating.
 
-### Woodworking Calculators
+**Tool Inventory** — keep track of your shop tools, their condition, brand, model, and notes. There's a catalog of 60+ common tools so you can add them quickly instead of typing everything out.
 
-A suite of 8 specialized calculators:
+You can use everything without an account — data stays in your browser. If you sign in with Google, you can save projects to the cloud and access them from anywhere.
 
-| Calculator | Purpose |
-|------------|---------|
-| **Board Feet** | Calculate lumber volume and cost |
-| **Fraction Math** | Add, subtract, multiply, divide fractions |
-| **Golden Ratio** | Apply φ (1.618) for pleasing proportions |
-| **Angle & Slope** | Right triangle solver for stairs, roofs, angled cuts |
-| **Shelf Spacing** | Evenly distribute shelves in cabinets |
-| **Taper Jig** | Calculate angles for tapered legs |
-| **Fraction Reference** | Quick lookup table (1/16" through 1") |
-| **Wood Movement** | Estimate seasonal expansion/contraction |
+## Running It Yourself
 
-### Tool Inventory
+You'll need Node.js installed. Then:
 
-Track your shop tools with condition ratings, brands, models, and notes. Includes a catalog of 60+ common woodworking tools for quick addition.
+```bash
+git clone https://github.com/nmacchitella/Kerf-Your-Enthusiasm.git
+cd Kerf-Your-Enthusiasm/kerfuffle
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). That's it for the basics — the cut optimizer and all calculators work right away with browser storage.
+
+### If You Want Accounts & Cloud Storage
+
+Create a `.env.local` file (there's a `.env.local.example` to copy from):
+
+```
+# Database — uses SQLite locally, or Turso in production
+TURSO_DATABASE_URL=libsql://your-database.turso.io
+TURSO_AUTH_TOKEN=your-auth-token
+
+# Auth
+BETTER_AUTH_SECRET=generate-a-random-32-character-string
+BETTER_AUTH_URL=http://localhost:3000
+
+# Google OAuth
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+
+# App URL
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
+
+For local development, SQLite runs out of the box — the database lives in `./data/app.db`. For Google OAuth, you'll need to set up credentials in the [Google Cloud Console](https://console.cloud.google.com/). If you don't care about sign-in, skip all of this — the app works fine without it.
+
+### Docker
+
+There's a Dockerfile if that's more your style:
+
+```bash
+docker build -t kerfuffle .
+docker run -p 3000:3000 kerfuffle
+```
 
 ## Tech Stack
 
-- **Next.js 16** - React framework
-- **React 19** - UI library
-- **TypeScript** - Type safety
-- **Tailwind CSS 4** - Styling
-- **jsPDF** - PDF generation
-
-## Getting Started
-
-```bash
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
-
-# Build for production
-npm run build
-
-# Start production server
-npm start
-```
-
-Open [http://localhost:3000](http://localhost:3000) to view the app.
-
-## Project Structure
-
-```
-src/
-├── app/
-│   ├── cut-list/       # Cut optimization page
-│   ├── calculators/    # Woodworking calculators
-│   └── tools/          # Tool inventory
-├── components/
-│   ├── Navigation.tsx
-│   └── ui/             # Reusable UI components
-├── hooks/
-│   └── useLocalStorage.ts
-├── lib/
-│   ├── constants.ts    # Presets and configurations
-│   ├── cut-optimizer.ts # Optimization algorithms
-│   └── fraction-utils.ts
-└── types/
-    └── index.ts
-```
-
-## How It Works
-
-### Cut Optimization Algorithms
-
-The app implements three bin-packing algorithms and automatically selects the best result:
-
-1. **Guillotine** - Rectangular partitioning with usability scoring
-2. **Shelf Packing** - Horizontal shelf organization
-3. **Branch & Bound** - Exhaustive search with pruning (time-limited)
-
-Each algorithm accounts for blade kerf, considers rotated orientations, and tracks waste percentage.
-
-### Data Persistence
-
-All data (stock, cuts, tools) is stored in browser localStorage. No account required, no data leaves your device.
+Next.js 16, React 19, TypeScript, Tailwind CSS 4, Drizzle ORM with SQLite/Turso, Better-Auth for authentication, jsPDF for exports.
 
 ## License
 
-MIT
+MIT — do whatever you want with it.
