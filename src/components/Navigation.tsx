@@ -18,7 +18,7 @@ export function Navigation() {
   const pathname = usePathname();
   const { data: session, isPending } = useSession();
 
-  const navItems = session ? [...authNavItems, ...publicNavItems] : publicNavItems;
+  const navItems = (!isPending && session) ? [...authNavItems, ...publicNavItems] : publicNavItems;
 
   return (
     <nav className="flex items-center justify-between">

@@ -1,16 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { auth } from '@/lib/auth';
+import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
 import { projects, stocks, cuts } from '@/db/schema';
 import { eq, desc } from 'drizzle-orm';
-import { headers } from 'next/headers';
 import { rateLimit, getClientIP, rateLimitResponse } from '@/lib/rate-limit';
 
 export async function GET() {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const userProjects = await db.query.projects.findMany({
     where: eq(projects.userId, session.user.id),
@@ -32,10 +28,7 @@ export async function POST(request: NextRequest) {
     return rateLimitResponse(rl.resetIn);
   }
 
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const body = await request.json();
 
@@ -52,11 +45,12 @@ export async function POST(request: NextRequest) {
   // If stocks were provided, insert them
   if (body.stocks?.length) {
     await db.insert(stocks).values(
-      body.stocks.map((s: { name: string; l: number; w: number; qty: number; mat: string }, i: number) => ({
+      body.stocks.map((s: { name: string; l: number; w: number; t?: number; qty: number; mat: string }, i: number) => ({
         projectId: project.id,
         name: s.name,
         length: s.l,
         width: s.w,
+        thickness: s.t ?? 0,
         quantity: s.qty,
         material: s.mat,
         sortOrder: i,
@@ -67,11 +61,12 @@ export async function POST(request: NextRequest) {
   // If cuts were provided, insert them
   if (body.cuts?.length) {
     await db.insert(cuts).values(
-      body.cuts.map((c: { label: string; l: number; w: number; qty: number; mat: string }, i: number) => ({
+      body.cuts.map((c: { label: string; l: number; w: number; t?: number; qty: number; mat: string }, i: number) => ({
         projectId: project.id,
         label: c.label,
         length: c.l,
         width: c.w,
+        thickness: c.t ?? 0,
         quantity: c.qty,
         material: c.mat || '',
         sortOrder: i,

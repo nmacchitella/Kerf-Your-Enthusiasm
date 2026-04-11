@@ -6,64 +6,138 @@ Yes, it's a pun. No, I'm not sorry.
 
 I like to build things — apps, but also actual things. Furniture, shelves, the occasional cutting board nobody asked for. Kerf Your Enthusiasm is a woodworking toolkit that helps with the annoying math that *should* be easy for someone with an MSc in Applied Math, but gets surprisingly complicated when you grow up metric and suddenly have to deal with imperial fractions. Also, when you're moving lumber around and covered in sawdust, you start doubting your own brain. This app is that second opinion.
 
+---
+
 ## What It Does
 
-**Cut List Optimizer** — the main thing. You tell it what lumber you have and what pieces you need, and it figures out how to cut everything with the least waste. It accounts for blade kerf (the material the saw eats), tries multiple algorithms (guillotine packing, shelf packing, branch & bound), and picks the best layout. You get a visual SVG of where every cut goes, and you can export to PDF, CSV, or SVG to bring to the shop.
+### Cut List Optimizer
+The main thing. Tell it what sheets you have and what pieces you need — it figures out how to cut everything with the least waste.
 
-**Calculators** — a suite of 8 little tools for shop math: board feet, fraction arithmetic, golden ratio, angles & slopes, shelf spacing, taper jig angles, a fraction reference chart, and wood movement estimation. Nothing fancy, but exactly the kind of thing you need mid-project when your brain stops cooperating.
+- Tries multiple algorithms (guillotine packing, shelf packing, branch & bound) and picks the best layout
+- Accounts for blade kerf and sheet padding
+- Material matching: constrain parts to specific stock materials (Plywood, MDF, Baltic Birch, etc.)
+- Thickness matching: parts snap to stock of the right thickness, or leave it as "any"
+- Groups: bundle related parts together with a quantity multiplier (e.g. "make 4 of this cabinet carcass")
+- Visual SVG layout showing every cut placement, with colour-coded parts and optional labels
+- Export to PDF, CSV, or SVG to bring to the shop
 
-**Tool Inventory** — keep track of your shop tools, their condition, brand, model, and notes. There's a catalog of 60+ common tools so you can add them quickly instead of typing everything out.
+### STEP File Import
+For when your project started in CAD. Upload a `.step` file, pick which faces you want to cut from which bodies, and they land in your cut list as properly dimensioned parts with DXF outlines ready for a CNC router or VCarve Pro.
 
-You can use everything without an account — data stays in your browser. If you sign in with Google, you can save projects to the cloud and access them from anywhere.
+### Calculators
+Eight shop-math tools for mid-project moments:
+
+| Calculator | What it does |
+|---|---|
+| Board Feet | Volume → price estimator |
+| Fraction Arithmetic | Add/subtract/multiply imperial fractions |
+| Golden Ratio | Find the harmonious dimension given one side |
+| Angles & Slopes | Rise/run/angle conversion |
+| Shelf Spacing | Optimal shelf spacing for a given height and item count |
+| Taper Jig | Calculate taper jig offset angle |
+| Fraction Reference | Quick decimal ↔ fraction chart |
+| Wood Movement | Seasonal expansion/contraction estimate by species |
+
+### Tool Inventory
+Keep track of your shop tools — condition, brand, model, notes. Pre-populated catalog of 60+ common tools so you're not typing everything from scratch.
+
+---
 
 ## Running It Yourself
 
-You'll need Node.js installed. Then:
+You'll need Node.js 20+. Then:
 
 ```bash
 git clone https://github.com/nmacchitella/Kerf-Your-Enthusiasm.git
-cd Kerf-Your-Enthusiasm/kerfuffle
+cd "Kerf-Your-Enthusiasm/kerfuffle"
 npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). That's it for the basics — the cut optimizer and all calculators work right away with browser storage.
+Open [http://localhost:3000](http://localhost:3000). The cut optimizer and all calculators work immediately with local browser storage — no account needed.
 
-### If You Want Accounts & Cloud Storage
+### If You Want Accounts & Cloud Projects
 
-Create a `.env.local` file (there's a `.env.local.example` to copy from):
+Copy the example env file and fill it in:
 
+```bash
+cp .env.local.example .env.local
 ```
-# Database — uses SQLite locally, or Turso in production
-TURSO_DATABASE_URL=libsql://your-database.turso.io
-TURSO_AUTH_TOKEN=your-auth-token
 
-# Auth
+```env
 BETTER_AUTH_SECRET=generate-a-random-32-character-string
 BETTER_AUTH_URL=http://localhost:3000
-
-# Google OAuth
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
-
-# App URL
 NEXT_PUBLIC_APP_URL=http://localhost:3000
 ```
 
-For local development, SQLite runs out of the box — the database lives in `./data/app.db`. For Google OAuth, you'll need to set up credentials in the [Google Cloud Console](https://console.cloud.google.com/). If you don't care about sign-in, skip all of this — the app works fine without it.
+The SQLite database lives at `./data/app.db` and is created automatically on first run. For Google OAuth, set up credentials in the [Google Cloud Console](https://console.cloud.google.com/) with `http://localhost:3000/api/auth/callback/google` as the redirect URI.
 
-### Docker
+If you don't care about sign-in, skip all of this.
 
-There's a Dockerfile if that's more your style:
+### With the STEP/CNC Backend
+
+The STEP-to-DXF workflow requires the Python backend (FastAPI + CadQuery + OpenCASCADE). You'll need Python 3.11+:
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate       # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Then run both together:
+
+```bash
+npm run dev:all
+```
+
+Or separately:
+
+```bash
+npm run dev          # Next.js on :3000
+npm run dev:backend  # FastAPI on :8000
+```
+
+---
+
+## Docker
+
+The easiest way to run the full stack (Next.js + Python backend + persistent database):
+
+```bash
+cp .env.local.example .env
+# fill in BETTER_AUTH_SECRET and, optionally, Google OAuth credentials
+
+docker compose up --build
+```
+
+Open [http://localhost:3000](http://localhost:3000). The SQLite database persists in a Docker volume so it survives container restarts.
+
+To run only the Next.js app without the STEP backend:
 
 ```bash
 docker build -t kerfuffle .
-docker run -p 3000:3000 kerfuffle
+docker run -p 3000:3000 \
+  -e BETTER_AUTH_SECRET=your-secret \
+  -v kerfuffle-data:/data \
+  kerfuffle
 ```
+
+> **Note:** the Python backend image is large (~1 GB) because CadQuery requires OpenCASCADE native binaries. If you don't need STEP file import, you can omit the `backend` service and the image stays small.
+
+---
 
 ## Tech Stack
 
-Next.js 16, React 19, TypeScript, Tailwind CSS 4, Drizzle ORM with SQLite/Turso, Better-Auth for authentication, jsPDF for exports.
+- **Frontend:** Next.js 16, React 19, TypeScript, Tailwind CSS 4
+- **Database:** SQLite via Drizzle ORM (local) 
+- **Auth:** Better-Auth with Google OAuth
+- **STEP/CAD:** FastAPI, CadQuery, ezdxf (Python)
+- **Exports:** jsPDF, JSZip
+
+---
 
 ## License
 

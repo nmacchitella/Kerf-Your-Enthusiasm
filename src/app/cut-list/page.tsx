@@ -16,12 +16,12 @@ export default function CutListPage() {
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [projectName, setProjectName] = useState('');
   const [stocks, setStocks] = useLocalStorage<Stock[]>('kerf-your-enthusiasm-stocks', [
-    { id: 1, name: '4×8 Plywood', l: 96, w: 48, qty: 1, mat: 'Plywood' },
+    { id: 1, name: '4×8 Plywood', l: 96, w: 48, t: 0, qty: 1, mat: 'Plywood' },
   ]);
   const [cuts, setCuts] = useLocalStorage<Cut[]>('kerf-your-enthusiasm-cuts', [
-    { id: 1, label: 'Shelf', l: 24, w: 12, qty: 4, mat: '' },
-    { id: 2, label: 'Side', l: 36, w: 18, qty: 2, mat: '' },
-    { id: 3, label: 'Top', l: 48, w: 24, qty: 1, mat: '' },
+    { id: 1, label: 'Shelf', l: 24, w: 12, t: 0, qty: 4, mat: '' },
+    { id: 2, label: 'Side', l: 36, w: 18, t: 0, qty: 2, mat: '' },
+    { id: 3, label: 'Top', l: 48, w: 24, t: 0, qty: 1, mat: '' },
   ]);
   const [kerf, setKerf] = useState(0.125);
   const [showAdv, setShowAdv] = useState(false);
@@ -29,11 +29,11 @@ export default function CutListPage() {
   const [showLabels, setShowLabels] = useState(true);
   const [hoveredPart, setHoveredPart] = useState<{ sheetIndex: number; cutIndex: number } | null>(null);
 
-  const addStock = (preset?: { name: string; length: number; width: number }) => {
+  const addStock = (preset?: { name: string; length: number; width: number; thickness?: number }) => {
     const s = preset || { name: 'Custom', length: 96, width: 48 };
     setStocks([
       ...stocks,
-      { id: Date.now(), name: s.name, l: s.length, w: s.width, qty: 1, mat: 'Plywood' },
+      { id: Date.now(), name: s.name, l: s.length, w: s.width, t: s.thickness ?? 0, qty: 1, mat: 'Plywood' },
     ]);
   };
 
@@ -60,8 +60,8 @@ export default function CutListPage() {
         body: JSON.stringify({
           name: projectName,
           kerf,
-          stocks: stocks.map(s => ({ name: s.name, l: s.l, w: s.w, qty: s.qty, mat: s.mat })),
-          cuts: cuts.map(c => ({ label: c.label, l: c.l, w: c.w, qty: c.qty, mat: c.mat })),
+          stocks: stocks.map(s => ({ name: s.name, l: s.l, w: s.w, t: s.t ?? 0, qty: s.qty, mat: s.mat })),
+          cuts: cuts.map(c => ({ label: c.label, l: c.l, w: c.w, t: c.t ?? 0, qty: c.qty, mat: c.mat })),
         }),
       });
       if (res.ok) {
@@ -469,7 +469,7 @@ export default function CutListPage() {
         <div className="bg-white rounded-md p-4 shadow-sm border border-slate-200 space-y-2">
           <div className="flex justify-between items-center">
             <h2 className="text-slate-500 text-xs font-medium uppercase tracking-wide">Add Parts</h2>
-            <button onClick={() => setCuts([...cuts, { id: Date.now(), label: `Part ${cuts.length + 1}`, l: 12, w: 12, qty: 1, mat: '' }])} className="text-xs text-slate-500 hover:text-slate-700">+add</button>
+            <button onClick={() => setCuts([...cuts, { id: Date.now(), label: `Part ${cuts.length + 1}`, l: 12, w: 12, t: 0, qty: 1, mat: '' }])} className="text-xs text-slate-500 hover:text-slate-700">+add</button>
           </div>
           <table className="w-full text-xs">
             <thead><tr className="text-slate-400">

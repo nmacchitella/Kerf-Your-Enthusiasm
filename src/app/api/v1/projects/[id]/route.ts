@@ -1,18 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { auth } from '@/lib/auth';
+import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
 import { projects, stocks, cuts } from '@/db/schema';
 import { eq, and } from 'drizzle-orm';
-import { headers } from 'next/headers';
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const { id } = await params;
 
@@ -35,10 +31,7 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const { id } = await params;
   const body = await request.json();
@@ -59,6 +52,10 @@ export async function PUT(
       name: body.name ?? existing.name,
       description: body.description ?? existing.description,
       kerf: body.kerf ?? existing.kerf,
+      units: body.units ?? existing.units,
+      groupMultipliers: body.groupMultipliers !== undefined
+        ? JSON.stringify(body.groupMultipliers)
+        : existing.groupMultipliers,
       updatedAt: new Date(),
     })
     .where(eq(projects.id, id))
@@ -69,11 +66,12 @@ export async function PUT(
     await db.delete(stocks).where(eq(stocks.projectId, id));
     if (body.stocks.length) {
       await db.insert(stocks).values(
-        body.stocks.map((s: { name: string; l: number; w: number; qty: number; mat: string }, i: number) => ({
+        body.stocks.map((s: { name: string; l: number; w: number; t?: number; qty: number; mat: string }, i: number) => ({
           projectId: id,
           name: s.name,
           length: s.l,
           width: s.w,
+          thickness: s.t ?? 0,
           quantity: s.qty,
           material: s.mat,
           sortOrder: i,
@@ -87,13 +85,22 @@ export async function PUT(
     await db.delete(cuts).where(eq(cuts.projectId, id));
     if (body.cuts.length) {
       await db.insert(cuts).values(
-        body.cuts.map((c: { label: string; l: number; w: number; qty: number; mat: string }, i: number) => ({
+        body.cuts.map((c: {
+          label: string; l: number; w: number; t?: number; qty: number; mat: string;
+          group?: string;
+          stepSessionId?: string; stepBodyIndex?: number; stepFaceIndex?: number;
+        }, i: number) => ({
           projectId: id,
           label: c.label,
           length: c.l,
           width: c.w,
+          thickness: c.t ?? 0,
           quantity: c.qty,
           material: c.mat || '',
+          groupName: c.group || '',
+          stepSessionId: c.stepSessionId ?? null,
+          stepBodyIndex: c.stepBodyIndex ?? null,
+          stepFaceIndex: c.stepFaceIndex ?? null,
           sortOrder: i,
         }))
       );
@@ -116,10 +123,7 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const { id } = await params;
 

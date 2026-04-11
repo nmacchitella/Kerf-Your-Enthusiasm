@@ -1,4 +1,6 @@
-import { Stock, Cut, Sheet, OptimizationResult, PlacedCut, Rect } from '@/types';
+import { Stock, Cut, Sheet, OptimizationResult, PlacedCut, Rect, PinnedPlacement, SheetAssignment } from '@/types';
+import { MaxRectsPacker, PACKING_LOGIC } from 'maxrects-packer';
+import { expandCutsWithKeys, makeInstanceKey } from '@/lib/instance-key';
 
 interface Placement {
   rectIndex: number;
@@ -150,6 +152,87 @@ function splitRectangle(
 }
 
 /**
+ * Merge adjacent free rectangles to recover usable space lost by guillotine splits.
+ * Without this, free rects that share an edge are never recombined, wasting potential space.
+ */
+function mergeFreeRects(rects: Rect[]): Rect[] {
+  const result = [...rects];
+  let merged = true;
+  while (merged) {
+    merged = false;
+    outer: for (let i = 0; i < result.length; i++) {
+      for (let j = i + 1; j < result.length; j++) {
+        const a = result[i], b = result[j];
+        // Horizontal neighbors: same y and h, touching on x-axis
+        if (a.h === b.h && a.y === b.y) {
+          if (a.x + a.w === b.x) {
+            result[i] = { ...a, w: a.w + b.w };
+            result.splice(j, 1); merged = true; break outer;
+          }
+          if (b.x + b.w === a.x) {
+            result[i] = { ...a, x: b.x, w: a.w + b.w };
+            result.splice(j, 1); merged = true; break outer;
+          }
+        }
+        // Vertical neighbors: same x and w, touching on y-axis
+        if (a.w === b.w && a.x === b.x) {
+          if (a.y + a.h === b.y) {
+            result[i] = { ...a, h: a.h + b.h };
+            result.splice(j, 1); merged = true; break outer;
+          }
+          if (b.y + b.h === a.y) {
+            result[i] = { ...a, y: b.y, h: a.h + b.h };
+            result.splice(j, 1); merged = true; break outer;
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * MaxRects-style space subtraction: for each free rect that overlaps the occupied
+ * area, split it into up to 4 non-overlapping sub-rects covering the remaining free
+ * space. This is correct for arbitrary (non-top-left-aligned) occupied positions,
+ * unlike guillotine splitRectangle which always assumes top-left placement.
+ */
+function subtractOccupied(
+  freeRects: Rect[],
+  ox: number, oy: number, ow: number, oh: number,
+  kerf: number
+): Rect[] {
+  // The occupied footprint including kerf buffer (prevents adjacent cuts from being
+  // placed right up against the occupied area without the kerf gap)
+  const ox2 = ox + ow + kerf;
+  const oy2 = oy + oh + kerf;
+
+  const result: Rect[] = [];
+  for (const fr of freeRects) {
+    // No overlap — keep unchanged
+    if (ox >= fr.x + fr.w || ox2 <= fr.x || oy >= fr.y + fr.h || oy2 <= fr.y) {
+      result.push(fr);
+      continue;
+    }
+    // Left strip: fr.x → ox, full height — no corner overlap with top/bottom
+    if (ox > fr.x)
+      result.push({ x: fr.x, y: fr.y, w: ox - fr.x, h: fr.h });
+    // Right strip: ox2 → fr.x+fr.w, full height
+    if (ox2 < fr.x + fr.w)
+      result.push({ x: ox2, y: fr.y, w: fr.x + fr.w - ox2, h: fr.h });
+    // Top/bottom strips span only the horizontal band between the left and right
+    // strips — this prevents corner overlap with left/right strips
+    const innerX  = Math.max(fr.x, ox);
+    const innerX2 = Math.min(fr.x + fr.w, ox2);
+    if (oy > fr.y && innerX < innerX2)
+      result.push({ x: innerX, y: fr.y, w: innerX2 - innerX, h: oy - fr.y });
+    if (oy2 < fr.y + fr.h && innerX < innerX2)
+      result.push({ x: innerX, y: oy2, w: innerX2 - innerX, h: fr.y + fr.h - oy2 });
+  }
+  return result;
+}
+
+/**
  * Score a set of rectangles based on how useful they are for remaining cuts
  */
 function scoreRectangles(rects: Rect[], remainingCuts: Cut[], kerf: number): number {
@@ -191,7 +274,7 @@ function findBestPlacement(
   const preferredRotation = sameLabel?.rot;
 
   // Orientation consistency penalty (very soft - only a tiebreaker, never affects sheet count)
-  const ORIENTATION_PENALTY = 0.1;
+  const ORIENTATION_PENALTY = 500;
 
   for (let i = 0; i < rects.length; i++) {
     const r = rects[i];
@@ -244,9 +327,13 @@ function sortCuts(cuts: Cut[]): Cut[] {
 
 /**
  * Check if a stock can fit a cut (accounting for kerf properly)
+ * t=0 means "unspecified thickness" — matches any stock
  */
 function stockCanFitCut(stock: Stock, cut: Cut): boolean {
-  // A cut fits if it's <= stock dimensions (no kerf needed at edges)
+  const thicknessOk =
+    (stock.t ?? 0) === 0 || (cut.t ?? 0) === 0 ||
+    Math.abs((stock.t ?? 0) - (cut.t ?? 0)) < 0.001;
+  if (!thicknessOk) return false;
   return (cut.w <= stock.w && cut.l <= stock.l) ||
          (cut.l <= stock.w && cut.w <= stock.l);
 }
@@ -259,10 +346,10 @@ function selectBestStock(stocks: Stock[], remainingCuts: Cut[], stockUsage: Map<
 
   if (remainingCuts.length === 0) return null;
 
-  const largestCut = remainingCuts[0];
-  console.log('  Largest remaining cut:', `${largestCut.label} ${largestCut.w}×${largestCut.l}`);
-
-  // Filter stocks that can fit the largest cut AND have remaining quantity
+  // Filter stocks that have remaining quantity AND can fit at least one remaining cut.
+  // Using "any cut" (not just the largest) is critical when cuts have mixed thickness/
+  // material: if 0.5" stock is exhausted, 0.75" stock should still be picked up for
+  // the 0.75" cuts rather than aborting the whole optimization.
   const viableStocks = stocks.filter(s => {
     const used = stockUsage.get(s.id) || 0;
     const available = (s.qty ?? 1) - used;
@@ -270,12 +357,14 @@ function selectBestStock(stocks: Stock[], remainingCuts: Cut[], stockUsage: Map<
       console.log(`    Stock ${s.name} - no more available (used ${used}/${s.qty ?? 1})`);
       return false;
     }
-    const cMat = largestCut.mat || '';
-    const sMat = s.mat || '';
-    if (cMat && sMat && cMat !== sMat) return false;
-    const canFit = stockCanFitCut(s, largestCut);
-    console.log(`    Stock ${s.name} (${s.w}×${s.l}) qty:${available}/${s.qty ?? 1} can fit: ${canFit}`);
-    return canFit;
+    const canFitAny = remainingCuts.some(cut => {
+      const cMat = cut.mat || '';
+      const sMat = s.mat || '';
+      if (cMat && sMat && cMat !== sMat) return false;
+      return stockCanFitCut(s, cut);
+    });
+    console.log(`    Stock ${s.name} (${s.w}×${s.l}) qty:${available}/${s.qty ?? 1} canFitAny: ${canFitAny}`);
+    return canFitAny;
   });
 
   console.log('  Viable stocks:', viableStocks.map(s => s.name));
@@ -337,13 +426,15 @@ function selectBestStock(stocks: Stock[], remainingCuts: Cut[], stockUsage: Map<
 }
 
 /**
- * Pack cuts onto a single sheet, optionally forcing the first cut's orientation
+ * Pack cuts onto a single sheet, optionally forcing the first cut's orientation.
+ * pinnedOnThisSheet: already-placed cuts that pre-occupy space (they're added as-is).
  */
 function packSheet(
   stock: Stock,
   cuts: Cut[],
   kerf: number,
-  forceFirstRotation?: boolean
+  forceFirstRotation?: boolean,
+  pinnedOnThisSheet?: PlacedCut[]
 ): { sheet: Sheet; placed: Cut[]; unplaced: Cut[] } {
   const sheet: Sheet = {
     w: stock.w,
@@ -354,6 +445,18 @@ function packSheet(
     rects: [{ x: 0, y: 0, w: stock.w, h: stock.l }],
   };
 
+  // Pre-occupy space for pinned parts using MaxRects-style subtraction.
+  // subtractOccupied handles arbitrary positions correctly (splitRectangle would
+  // only work if the pinned cut is at the top-left of a free rect).
+  if (pinnedOnThisSheet && pinnedOnThisSheet.length > 0) {
+    for (const pinned of pinnedOnThisSheet) {
+      sheet.cuts.push(pinned);
+      sheet.rects = subtractOccupied(sheet.rects, pinned.x, pinned.y, pinned.pw, pinned.ph, kerf);
+      sheet.rects = mergeFreeRects(sheet.rects);
+      sheet.rects.sort((a, b) => a.y !== b.y ? a.y - b.y : a.x - b.x);
+    }
+  }
+
   const placed: Cut[] = [];
   const unplaced: Cut[] = [];
 
@@ -361,8 +464,11 @@ function packSheet(
     const c = cuts[i];
     const cMat = c.mat || '';
     const sMat = stock.mat || '';
+    const thicknessOk =
+      (stock.t ?? 0) === 0 || (c.t ?? 0) === 0 ||
+      Math.abs((stock.t ?? 0) - (c.t ?? 0)) < 0.001;
 
-    if (cMat && sMat && cMat !== sMat) {
+    if ((cMat && sMat && cMat !== sMat) || !thicknessOk) {
       unplaced.push(c);
       continue;
     }
@@ -395,6 +501,7 @@ function packSheet(
         pw,
         ph,
         rot: placement.rotated,
+        instanceKey: (c as Cut & { instanceKey?: string }).instanceKey ?? makeInstanceKey(c.id, 0),
       });
       placed.push(c);
 
@@ -405,6 +512,7 @@ function packSheet(
       const newRects = vScore > hScore ? splits.vertical : splits.horizontal;
 
       sheet.rects.splice(placement.rectIndex, 1, ...newRects);
+      sheet.rects = mergeFreeRects(sheet.rects);
       sheet.rects.sort((a, b) => a.y !== b.y ? a.y - b.y : a.x - b.x);
     } else {
       unplaced.push(c);
@@ -431,16 +539,12 @@ export function optimizeCuts(
   const results: Sheet[] = [];
   const stockUsage = new Map<number, number>();
 
-  // Expand cuts by quantity
-  let allCuts = cuts.flatMap(c =>
-    Array(c.qty).fill(null).map(() => ({ ...c, qty: 1 }))
-  );
-
-  // Sort by area (largest first)
-  allCuts = sortCuts(allCuts);
+  // Expand cuts by quantity with stable instance keys
+  const allCutsExpanded = expandCutsWithKeys(cuts);
+  const allCuts = sortCuts(allCutsExpanded) as typeof allCutsExpanded;
   console.log('Sorted cuts (by area):', allCuts.map(c => `${c.label} ${c.w}×${c.l} = ${c.w * c.l} sq in`));
 
-  let remaining = [...allCuts];
+  let remaining: Cut[] = [...allCuts];
   let sheetCount = 0;
 
   while (remaining.length > 0 && sheetCount < 50) {
@@ -503,14 +607,12 @@ export function optimizeCutsShelf(
   const results: Sheet[] = [];
   const stockUsage = new Map<number, number>();
 
-  let allCuts = cuts.flatMap(c =>
-    Array(c.qty).fill(null).map(() => ({ ...c, qty: 1 }))
-  );
+  const allCuts = expandCutsWithKeys(cuts);
 
   // Sort by height for shelf packing
   allCuts.sort((a, b) => Math.max(b.l, b.w) - Math.max(a.l, a.w));
 
-  let remaining = [...allCuts];
+  let remaining: Cut[] = [...allCuts];
   let sheetCount = 0;
 
   while (remaining.length > 0 && sheetCount < 50) {
@@ -537,7 +639,10 @@ export function optimizeCutsShelf(
     for (const c of remaining) {
       const cMat = c.mat || '';
       const sMat = stock.mat || '';
-      if (cMat && sMat && cMat !== sMat) {
+      const thicknessOkShelf =
+        (stock.t ?? 0) === 0 || (c.t ?? 0) === 0 ||
+        Math.abs((stock.t ?? 0) - (c.t ?? 0)) < 0.001;
+      if ((cMat && sMat && cMat !== sMat) || !thicknessOkShelf) {
         left.push(c);
         continue;
       }
@@ -577,6 +682,7 @@ export function optimizeCutsShelf(
           pw,
           ph,
           rot: rotated,
+          instanceKey: (c as Cut & { instanceKey?: string }).instanceKey ?? makeInstanceKey(c.id, 0),
         });
         currentX += needsKerfX + pw;
         shelfHeight = Math.max(shelfHeight, ph);
@@ -595,6 +701,7 @@ export function optimizeCutsShelf(
             pw,
             ph,
             rot: rotated,
+            instanceKey: (c as Cut & { instanceKey?: string }).instanceKey ?? makeInstanceKey(c.id, 0),
           });
           currentX = pw;
           shelfHeight = ph;
@@ -613,6 +720,142 @@ export function optimizeCutsShelf(
 
     remaining = left;
     if (sheet.cuts.length === 0) break;
+  }
+
+  return { sheets: results, unplaced: remaining };
+}
+
+// ============================================================================
+// MAXRECTS PACKING ALGORITHM
+// ============================================================================
+
+/**
+ * MaxRects packing algorithm — superior to guillotine because it maintains up to
+ * 4 free sub-rectangles per placement (vs 2 with guillotine), giving future cuts
+ * far more fitting options. Runs MAX_EDGE and MAX_AREA strategies, picks the better.
+ */
+export function optimizeCutsMaxRects(
+  stocks: Stock[],
+  cuts: Cut[],
+  kerf: number
+): OptimizationResult {
+  const results: Sheet[] = [];
+  const stockUsage = new Map<number, number>();
+
+  const allCuts = sortCuts(expandCutsWithKeys(cuts)) as Array<Cut & { instanceKey: string }>;
+
+  let remaining: Cut[] = [...allCuts];
+  let sheetCount = 0;
+
+  while (remaining.length > 0 && sheetCount < 50) {
+    const stock = selectBestStock(stocks, remaining, stockUsage);
+    if (!stock) break;
+
+    // Split remaining cuts into eligible (match this stock) and ineligible
+    const eligible: Cut[] = [];
+    const ineligible: Cut[] = [];
+    for (const c of remaining) {
+      const cMat = c.mat || '';
+      const sMat = stock.mat || '';
+      const thicknessOk =
+        (stock.t ?? 0) === 0 || (c.t ?? 0) === 0 ||
+        Math.abs((stock.t ?? 0) - (c.t ?? 0)) < 0.001;
+      if ((cMat && sMat && cMat !== sMat) || !thicknessOk) {
+        ineligible.push(c);
+      } else {
+        eligible.push(c);
+      }
+    }
+
+    // maxrects-packer's allowRotation only picks the better-scoring orientation when
+    // BOTH orientations fit — it won't rotate to make an oversized piece fit.
+    // Solution: pre-rotate cuts that only fit one way, track the pre-rotation state,
+    // and skip cuts that truly don't fit either way.
+    interface PackerInput {
+      width: number;
+      height: number;
+      cut: Cut;
+      preRotated: boolean;
+    }
+    const packerInputs: PackerInput[] = [];
+    const trulyIneligible: Cut[] = [];
+
+    for (const c of eligible) {
+      const normalFits  = c.w <= stock.w && c.l <= stock.l;
+      const rotatedFits = c.l <= stock.w && c.w <= stock.l;
+      if (normalFits) {
+        packerInputs.push({ width: c.w, height: c.l, cut: c, preRotated: false });
+      } else if (rotatedFits) {
+        packerInputs.push({ width: c.l, height: c.w, cut: c, preRotated: true });
+      } else {
+        trulyIneligible.push(c);
+      }
+    }
+
+    // Run MAX_EDGE and MAX_AREA strategies, keep the one placing more cuts on this sheet
+    let bestPlacedOnSheet: Cut[] = [];
+    let bestSheet: Sheet | null = null;
+
+    for (const logic of [PACKING_LOGIC.MAX_EDGE, PACKING_LOGIC.MAX_AREA] as const) {
+      const packer = new MaxRectsPacker(stock.w, stock.l, kerf, {
+        smart: false,
+        pot: false,
+        square: false,
+        allowRotation: true,
+        logic,
+      });
+
+      for (const input of packerInputs) {
+        packer.add(input.width, input.height, input);
+      }
+
+      // bins[0] is always the primary sheet bin (smart: false keeps size fixed)
+      const bin = packer.bins[0];
+      const placed = (bin?.rects ?? []).filter(r => !r.oversized);
+      if (placed.length === 0) continue;
+
+      if (placed.length > bestPlacedOnSheet.length) {
+        bestPlacedOnSheet = placed.map(r => (r.data as PackerInput).cut);
+        bestSheet = {
+          w: stock.w,
+          l: stock.l,
+          name: stock.name,
+          mat: stock.mat,
+          cuts: placed.map(r => {
+            const input = r.data as PackerInput;
+            // r.rot means the packer additionally rotated our (possibly pre-rotated) input.
+            // Overall rotation relative to original cut: preRotated XOR r.rot
+            const overallRot = input.preRotated !== r.rot;
+            const pw = r.width;
+            const ph = r.height;
+            const x = r.x;
+            const y = r.y;
+            return {
+              ...input.cut,
+              x, y, pw, ph,
+              rot: overallRot,
+              instanceKey: (input.cut as Cut & { instanceKey?: string }).instanceKey ?? makeInstanceKey(input.cut.id, 0),
+            };
+          }),
+          rects: [],
+        };
+      }
+    }
+
+    if (bestSheet && bestPlacedOnSheet.length > 0) {
+      stockUsage.set(stock.id, (stockUsage.get(stock.id) || 0) + 1);
+      results.push(bestSheet);
+      sheetCount++;
+
+      const placedSet = new Set(bestPlacedOnSheet);
+      remaining = [
+        ...eligible.filter(c => !placedSet.has(c)),
+        ...trulyIneligible,
+        ...ineligible,
+      ];
+    } else {
+      break;
+    }
   }
 
   return { sheets: results, unplaced: remaining };
@@ -680,7 +923,7 @@ function generatePlacements(
   const preferredRotation = sameLabel?.rot;
 
   // Orientation consistency penalty (very soft - only a tiebreaker, never affects sheet count)
-  const ORIENTATION_PENALTY = 0.1;
+  const ORIENTATION_PENALTY = 500;
 
   for (let i = 0; i < rects.length; i++) {
     const r = rects[i];
@@ -734,6 +977,7 @@ function applyPlacement(
     pw,
     ph,
     rot: placement.rotated,
+    instanceKey: (cut as Cut & { instanceKey?: string }).instanceKey ?? makeInstanceKey(cut.id, 0),
   };
 
   // Generate splits
@@ -840,14 +1084,12 @@ export function optimizeCutsOptimal(
   const stockUsage = new Map<number, number>();
 
   // Expand cuts by quantity and sort by area (largest first)
-  let allCuts = sortCuts(
-    cuts.flatMap(c => Array(c.qty).fill(null).map(() => ({ ...c, qty: 1 })))
-  );
+  const allCuts = sortCuts(expandCutsWithKeys(cuts)) as Array<Cut & { instanceKey: string }>;
 
   const totalCuts = allCuts.length;
   console.log('Total cuts to place:', totalCuts);
 
-  let remaining = [...allCuts];
+  let remaining: Cut[] = [...allCuts];
   let sheetCount = 0;
   const startTime = Date.now();
 
@@ -857,11 +1099,23 @@ export function optimizeCutsOptimal(
 
     console.log(`Sheet ${sheetCount + 1}: Searching optimal layout for ${stock.name} (${stock.w}×${stock.l})...`);
 
+    // Filter to only cuts that match this stock's material and thickness.
+    // Without this, B&B could place material-mismatched cuts on the sheet.
+    const eligibleForStock = remaining.filter(c => {
+      const cMat = c.mat || '';
+      const sMat = stock.mat || '';
+      if (cMat && sMat && cMat !== sMat) return false;
+      const thicknessOk =
+        (stock.t ?? 0) === 0 || (c.t ?? 0) === 0 ||
+        Math.abs((stock.t ?? 0) - (c.t ?? 0)) < 0.001;
+      return thicknessOk;
+    });
+
     // Initial state for this sheet
     const initialState: SearchState = {
       rects: [{ x: 0, y: 0, w: stock.w, h: stock.l }],
       placed: [],
-      remaining: remaining,
+      remaining: eligibleForStock,
       totalArea: stock.w * stock.l,
       usedArea: 0,
     };
@@ -976,41 +1230,186 @@ function compareSolutions(
 export function optimizeCutsBest(
   stocks: Stock[],
   cuts: Cut[],
-  kerf: number
+  kerf: number,
+  padding: number = 0,
+  pinnedPlacements: PinnedPlacement[] = [],
+  sheetAssignments: SheetAssignment[] = []
 ): OptimizationResult {
   console.log('═══════════════════════════════════════════════════════════');
   console.log('🪵 OPTIMIZE CUTS BEST - Starting optimization');
-  console.log('Stocks received:', JSON.stringify(stocks, null, 2));
-  console.log('Cuts received:', JSON.stringify(cuts, null, 2));
-  console.log('Kerf:', kerf);
+  console.log('Kerf:', kerf, '| Padding:', padding, '| Pinned:', pinnedPlacements.length, '| Assigned:', sheetAssignments.length);
   console.log('═══════════════════════════════════════════════════════════');
 
+  // Keys to exclude from free packing (already pinned or manually assigned)
+  const pinnedKeys = new Set(pinnedPlacements.map(p => p.key));
+  const assignedKeys = new Set(sheetAssignments.map(a => a.key));
+
+  // Inflate each cut by 2×padding so the optimizer reserves clearance space.
+  // After picking the best result we'll deflate back to real dimensions.
+  // Pinned cuts already carry real-world positions and are not inflated.
+  const effectiveCuts = padding > 0
+    ? cuts.map(c => ({ ...c, l: c.l + 2 * padding, w: c.w + 2 * padding }))
+    : cuts;
+
+  // If we have pinned placements, run a single-pass guillotine per sheet
+  // with pre-occupied space, then fill the rest with the best algorithm.
+  if (pinnedPlacements.length > 0 || sheetAssignments.length > 0) {
+    // Group pinned placements by sheet index
+    const pinnedBySheet = new Map<number, PlacedCut[]>();
+    for (const pp of pinnedPlacements) {
+      const existing = pinnedBySheet.get(pp.sheetIndex) ?? [];
+      existing.push({
+        ...pp.cut,
+        x: pp.x,
+        y: pp.y,
+        pw: pp.pw,
+        ph: pp.ph,
+        rot: pp.rot,
+        instanceKey: pp.key,
+      });
+      pinnedBySheet.set(pp.sheetIndex, existing);
+    }
+
+    // Free cuts = cuts NOT in pinned or assignment sets, expanded with keys
+    const pinnedCutSet = new Set([...pinnedKeys, ...assignedKeys]);
+    const expandedAll = expandCutsWithKeys(effectiveCuts);
+    const freeCuts = expandedAll.filter(c => !pinnedCutSet.has(c.instanceKey));
+
+    // Sheet-constrained cuts per sheet (non-pinned)
+    const assignedBySheet = new Map<number, Array<Cut & { instanceKey: string }>>();
+    for (const sa of sheetAssignments) {
+      const cut = expandedAll.find(c => c.instanceKey === sa.key);
+      if (!cut) continue;
+      const existing = assignedBySheet.get(sa.sheetIndex) ?? [];
+      existing.push(cut);
+      assignedBySheet.set(sa.sheetIndex, existing);
+    }
+
+    const resultSheets: Sheet[] = [];
+    const stockUsage = new Map<number, number>();
+
+    // Process pinned sheets first (they have a predetermined stock)
+    const handledSheetIndices = new Set<number>();
+    for (const [sheetIdx, pinnedCuts] of pinnedBySheet.entries()) {
+      // Infer stock from the pinned cuts' dimensions
+      // Use the first pinned cut's dimensions to infer stock, or just use the first stock
+      const stock = stocks.find(s => stocks.length === 1 || s.w >= pinnedCuts[0].pw) ?? stocks[0];
+      if (!stock) continue;
+
+      // Gather cuts for this sheet: assigned + free (try to fill remaining space)
+      const sheetAssigned = assignedBySheet.get(sheetIdx) ?? [];
+      const cutsForThisSheet = [...sheetAssigned, ...freeCuts];
+
+      const used = (stockUsage.get(stock.id) || 0);
+      if (used < (stock.qty ?? 1)) {
+        stockUsage.set(stock.id, used + 1);
+      }
+
+      const { sheet, placed } = packSheet(stock, cutsForThisSheet, kerf, undefined, pinnedCuts);
+      resultSheets.push(sheet);
+      handledSheetIndices.add(sheetIdx);
+
+      // Remove placed cuts from freeCuts
+      const placedKeys = new Set(placed.map(c => (c as Cut & { instanceKey?: string }).instanceKey));
+      freeCuts.splice(0, freeCuts.length, ...freeCuts.filter(c => !placedKeys.has(c.instanceKey)));
+    }
+
+    // Pack remaining free cuts with best algorithm
+    if (freeCuts.length > 0) {
+      // Re-aggregate free cuts back into qty>1 form for the algorithms
+      // (they re-expand internally via expandCutsWithKeys)
+      // Since freeCuts are already expanded, pass them as qty=1 each
+      const freeResult = optimizeCutsBest(stocks, freeCuts, kerf, 0, [], []);
+      resultSheets.push(...freeResult.sheets);
+
+      const deflated = padding > 0
+        ? {
+          sheets: resultSheets.map(sheet => ({
+            ...sheet,
+            cuts: sheet.cuts.map(pc => {
+              if (pinnedKeys.has(pc.instanceKey)) return pc; // don't deflate pinned
+              const orig = cuts.find(c => c.id === pc.id);
+              return orig ? {
+                ...pc,
+                l: orig.l, w: orig.w,
+                x: pc.x + padding, y: pc.y + padding,
+                pw: pc.pw - 2 * padding, ph: pc.ph - 2 * padding,
+              } : pc;
+            }),
+          })),
+          unplaced: freeResult.unplaced,
+        }
+        : { sheets: resultSheets, unplaced: freeResult.unplaced };
+
+      return deflated;
+    }
+
+    return { sheets: resultSheets, unplaced: [] };
+  }
+
+  // ── Standard path (no pinned placements) ──────────────────────────────────
   // Count total cuts
-  const totalCuts = cuts.reduce((sum, c) => sum + c.qty, 0);
+  const totalCuts = effectiveCuts.reduce((sum, c) => sum + c.qty, 0);
 
   // Run all algorithms
-  const guillotine = optimizeCuts(stocks, cuts, kerf);
-  const shelf = optimizeCutsShelf(stocks, cuts, kerf);
+  const guillotine = optimizeCuts(stocks, effectiveCuts, kerf);
+  const shelf = optimizeCutsShelf(stocks, effectiveCuts, kerf);
+  const maxrects = optimizeCutsMaxRects(stocks, effectiveCuts, kerf);
 
-  // For small inputs (≤15 cuts), also run the optimal branch-and-bound search
-  // For larger inputs, it might timeout but will still return best found
-  const timeLimit = totalCuts <= 10 ? 3000 : totalCuts <= 15 ? 2000 : 1000;
-  const optimal = optimizeCutsOptimal(stocks, cuts, kerf, timeLimit);
+  // Branch-and-bound is exponential — only useful for small inputs
+  const timeLimit = totalCuts <= 10 ? 3000 : 2000;
+  const optimal = totalCuts <= 15
+    ? optimizeCutsOptimal(stocks, effectiveCuts, kerf, timeLimit)
+    : null;
 
   const gStats = calculateStats(guillotine);
   const sStats = calculateStats(shelf);
-  const oStats = calculateStats(optimal);
+  const mStats = calculateStats(maxrects);
 
   console.log('Guillotine result:', gStats.sheets, 'sheets,', gStats.waste + '% waste,', guillotine.unplaced.length, 'unplaced');
   console.log('Shelf result:', sStats.sheets, 'sheets,', sStats.waste + '% waste,', shelf.unplaced.length, 'unplaced');
-  console.log('Optimal result:', oStats.sheets, 'sheets,', oStats.waste + '% waste,', optimal.unplaced.length, 'unplaced');
+  console.log('MaxRects result:', mStats.sheets, 'sheets,', mStats.waste + '% waste,', maxrects.unplaced.length, 'unplaced');
+  if (optimal) {
+    const oStats = calculateStats(optimal);
+    console.log('Optimal result:', oStats.sheets, 'sheets,', oStats.waste + '% waste,', optimal.unplaced.length, 'unplaced');
+  }
 
-  // Compare all three and pick the best
+  // Compare all algorithms and pick the best
   let { result, winner } = compareSolutions(guillotine, 'guillotine', shelf, 'shelf');
-  ({ result, winner } = compareSolutions(result, winner, optimal, 'optimal'));
+  ({ result, winner } = compareSolutions(result, winner, maxrects, 'maxrects'));
+  if (optimal) {
+    ({ result, winner } = compareSolutions(result, winner, optimal, 'optimal'));
+  }
 
   console.log('Winner:', winner);
   console.log('═══════════════════════════════════════════════════════════');
+
+  // Deflate placements back to real dimensions: shift x/y inward by padding,
+  // shrink pw/ph, and restore original l/w on each placed cut.
+  if (padding > 0) {
+    const origById = new Map(cuts.map(c => [c.id, c]));
+    result = {
+      sheets: result.sheets.map(sheet => ({
+        ...sheet,
+        cuts: sheet.cuts.map(pc => {
+          const orig = origById.get(pc.id)!;
+          return {
+            ...pc,
+            l: orig.l,
+            w: orig.w,
+            x: pc.x + padding,
+            y: pc.y + padding,
+            pw: pc.pw - 2 * padding,
+            ph: pc.ph - 2 * padding,
+          };
+        }),
+      })),
+      unplaced: result.unplaced.map(c => {
+        const orig = origById.get(c.id);
+        return orig ? { ...c, l: orig.l, w: orig.w } : c;
+      }),
+    };
+  }
 
   return result;
 }

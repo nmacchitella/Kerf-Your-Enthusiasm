@@ -1,17 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { auth } from '@/lib/auth';
+import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
 import { tools } from '@/db/schema';
 import { eq, asc } from 'drizzle-orm';
-import { headers } from 'next/headers';
 import { rateLimit, getClientIP, rateLimitResponse } from '@/lib/rate-limit';
 
 export async function GET() {
-  const session = await auth.api.getSession({ headers: await headers() });
-
-  if (!session) {
-    return NextResponse.json([]);
-  }
+  const session = getDevSession();
 
   const userTools = await db.query.tools.findMany({
     where: eq(tools.userId, session.user.id),
@@ -29,10 +24,7 @@ export async function POST(request: NextRequest) {
     return rateLimitResponse(rl.resetIn);
   }
 
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const body = await request.json();
 

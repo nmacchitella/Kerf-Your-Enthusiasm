@@ -1,6 +1,11 @@
 import { StockPreset } from '@/types';
 
 export const STOCK_PRESETS: StockPreset[] = [
+  { name: "4×8 Plywood ¾\"", length: 96, width: 48, thickness: 0.75 },
+  { name: "4×8 Plywood ½\"", length: 96, width: 48, thickness: 0.5 },
+  { name: "4×8 Plywood ¼\"", length: 96, width: 48, thickness: 0.25 },
+  { name: "4×8 MDF ¾\"",     length: 96, width: 48, thickness: 0.75 },
+  { name: "5×5 Baltic Birch ¾\"", length: 60, width: 60, thickness: 0.75 },
   { name: "4×8 Plywood", length: 96, width: 48 },
   { name: "4×4 Plywood", length: 48, width: 48 },
   { name: "5×5 Baltic Birch", length: 60, width: 60 },

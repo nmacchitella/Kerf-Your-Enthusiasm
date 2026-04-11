@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { auth } from '@/lib/auth';
+import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
 import { projects, stocks, cuts, tools } from '@/db/schema';
-import { headers } from 'next/headers';
 
 interface LocalStock {
   name: string;
@@ -29,10 +28,7 @@ interface LocalTool {
 }
 
 export async function POST(request: NextRequest) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const body = await request.json();
   const localStocks: LocalStock[] = body.stocks || [];

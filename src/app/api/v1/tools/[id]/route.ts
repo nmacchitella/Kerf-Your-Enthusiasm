@@ -1,18 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { auth } from '@/lib/auth';
+import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
 import { tools } from '@/db/schema';
 import { eq, and } from 'drizzle-orm';
-import { headers } from 'next/headers';
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const { id } = await params;
 
@@ -31,10 +27,7 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const { id } = await params;
   const body = await request.json();
@@ -68,10 +61,7 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const session = getDevSession();
 
   const { id } = await params;
 

@@ -1,59 +1,50 @@
-FROM node:20-alpine AS base
-
-# Install dependencies only when needed
-FROM base AS deps
+# ── Stage 1: install JS deps ──────────────────────────────────────────────────
+FROM node:20-alpine AS deps
 RUN apk add --no-cache libc6-compat python3 make g++
 WORKDIR /app
-
-# Install dependencies
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 RUN npm ci
 
-# Rebuild the source code only when needed
-FROM base AS builder
+# ── Stage 2: build Next.js ────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Disable telemetry during build
 ENV NEXT_TELEMETRY_DISABLED=1
+# Placeholder so the build succeeds — real values are injected at runtime
+ENV BETTER_AUTH_SECRET=placeholder
+ENV DATABASE_PATH=/data/app.db
 
-# Create data directory for build-time schema generation
-RUN mkdir -p data
+RUN mkdir -p data && npm run build
 
-RUN npm run build
-
-# Production image, copy all the files and run next
-FROM base AS runner
+# ── Stage 3: production runner ────────────────────────────────────────────────
+FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser  --system --uid 1001 nextjs
 
 COPY --from=builder /app/public ./public
+RUN mkdir .next && chown nextjs:nodejs .next
 
-# Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown nextjs:nodejs .next
-
-# Automatically leverage output traces to reduce image size
+# Standalone output + static assets
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-# Copy drizzle schema for migrations
-COPY --from=builder --chown=nextjs:nodejs /app/src/db ./src/db
-COPY --from=builder --chown=nextjs:nodejs /app/drizzle.config.ts ./
-COPY --from=builder --chown=nextjs:nodejs /app/node_modules/drizzle-kit ./node_modules/drizzle-kit
-COPY --from=builder --chown=nextjs:nodejs /app/node_modules/drizzle-orm ./node_modules/drizzle-orm
+# Drizzle schema + runtime deps for DB migrations
+COPY --from=builder --chown=nextjs:nodejs /app/src/db              ./src/db
+COPY --from=builder --chown=nextjs:nodejs /app/drizzle.config.ts   ./
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/drizzle-kit  ./node_modules/drizzle-kit
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/drizzle-orm  ./node_modules/drizzle-orm
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
 
 USER nextjs
 
 EXPOSE 3000
-
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 

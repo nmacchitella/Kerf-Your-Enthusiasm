@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useSession } from '@/lib/auth-client';
 
 interface Project {
@@ -17,11 +18,13 @@ interface Project {
 
 export default function DashboardPage() {
   const { data: session } = useSession();
+  const router = useRouter();
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNewForm, setShowNewForm] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   const [creating, setCreating] = useState(false);
+  const [creatingStep, setCreatingStep] = useState(false);
 
   useEffect(() => {
     fetchProjects();
@@ -63,6 +66,25 @@ export default function DashboardPage() {
       console.error('Failed to create project:', error);
     } finally {
       setCreating(false);
+    }
+  };
+
+  const handleNewStepProject = async () => {
+    setCreatingStep(true);
+    try {
+      const res = await fetch('/api/v1/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'New STEP Project' }),
+      });
+      if (res.ok) {
+        const project = await res.json();
+        router.push(`/projects/${project.id}/step`);
+      }
+    } catch (error) {
+      console.error('Failed to create project:', error);
+    } finally {
+      setCreatingStep(false);
     }
   };
 
@@ -111,12 +133,21 @@ export default function DashboardPage() {
             Welcome back, {session?.user.name || 'there'}
           </p>
         </div>
-        <button
-          onClick={() => setShowNewForm(true)}
-          className="px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors text-sm font-medium"
-        >
-          New Project
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handleNewStepProject}
+            disabled={creatingStep}
+            className="px-4 py-2 bg-slate-100 text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-200 transition-colors text-sm font-medium disabled:opacity-50"
+          >
+            {creatingStep ? 'Creating...' : '↑ Import STEP'}
+          </button>
+          <button
+            onClick={() => setShowNewForm(true)}
+            className="px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors text-sm font-medium"
+          >
+            New Project
+          </button>
+        </div>
       </div>
 
       {showNewForm && (
@@ -158,14 +189,23 @@ export default function DashboardPage() {
             No projects yet
           </h3>
           <p className="text-slate-600 mb-4">
-            Create your first project to start planning cuts
+            Create a project manually or import a STEP file to get started
           </p>
-          <button
-            onClick={() => setShowNewForm(true)}
-            className="px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors text-sm font-medium"
-          >
-            Create Project
-          </button>
+          <div className="flex gap-3 justify-center">
+            <button
+              onClick={handleNewStepProject}
+              disabled={creatingStep}
+              className="px-4 py-2 bg-slate-100 text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-200 transition-colors text-sm font-medium disabled:opacity-50"
+            >
+              {creatingStep ? 'Creating...' : '↑ Import STEP'}
+            </button>
+            <button
+              onClick={() => setShowNewForm(true)}
+              className="px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors text-sm font-medium"
+            >
+              New Cut List
+            </button>
+          </div>
         </div>
       ) : (
         <div className="space-y-3">
@@ -195,6 +235,12 @@ export default function DashboardPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  <Link
+                    href={`/projects/${project.id}/step`}
+                    className="px-3 py-1.5 text-sm text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded transition-colors"
+                  >
+                    ↑ STEP
+                  </Link>
                   <Link
                     href={`/projects/${project.id}`}
                     className="px-3 py-1.5 text-sm text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded transition-colors"

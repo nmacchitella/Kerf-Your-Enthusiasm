@@ -23,6 +23,7 @@ export const sessions = sqliteTable('sessions', {
   ipAddress: text('ip_address'),
   userAgent: text('user_agent'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 export const accounts = sqliteTable('accounts', {
@@ -32,10 +33,14 @@ export const accounts = sqliteTable('accounts', {
   accountId: text('account_id').notNull(),
   accessToken: text('access_token'),
   refreshToken: text('refresh_token'),
-  expiresAt: integer('expires_at', { mode: 'timestamp' }),
+  accessTokenExpiresAt: integer('access_token_expires_at', { mode: 'timestamp' }),
+  refreshTokenExpiresAt: integer('refresh_token_expires_at', { mode: 'timestamp' }),
   tokenType: text('token_type'),
   scope: text('scope'),
   idToken: text('id_token'),
+  password: text('password'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 export const verifications = sqliteTable('verifications', {
@@ -58,6 +63,8 @@ export const projects = sqliteTable('projects', {
   name: text('name').notNull(),
   description: text('description'),
   kerf: real('kerf').notNull().default(0.125),
+  units: text('units').default('in'),
+  groupMultipliers: text('group_multipliers').default('{}'),
   isPublic: integer('is_public', { mode: 'boolean' }).default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
@@ -70,6 +77,7 @@ export const stocks = sqliteTable('stocks', {
   name: text('name').notNull(),
   length: real('length').notNull(),
   width: real('width').notNull(),
+  thickness: real('thickness').default(0),
   quantity: integer('quantity').notNull().default(1),
   material: text('material').notNull().default('Plywood'),
   sortOrder: integer('sort_order').default(0),
@@ -82,8 +90,13 @@ export const cuts = sqliteTable('cuts', {
   label: text('label').notNull(),
   length: real('length').notNull(),
   width: real('width').notNull(),
+  thickness: real('thickness').default(0),
   quantity: integer('quantity').notNull().default(1),
   material: text('material').default(''),
+  groupName: text('group_name').default(''),
+  stepSessionId: text('step_session_id'),
+  stepBodyIndex: integer('step_body_index'),
+  stepFaceIndex: integer('step_face_index'),
   sortOrder: integer('sort_order').default(0),
 });
 
