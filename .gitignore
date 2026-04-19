@@ -42,3 +42,6 @@ next-env.d.ts
 
 # local database
 /data
+
+# python
+__pycache__/

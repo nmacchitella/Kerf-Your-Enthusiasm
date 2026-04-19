@@ -1,7 +1,7 @@
 'use client';
 
 import { useReducer, useEffect, useCallback } from 'react';
-import type { ManualOverrides, ManualOverride, PartInstanceKey, PlacedCut, Cut, OptimizationResult } from '@/types';
+import type { ManualOverrides, ManualOverride, PartInstanceKey, PlacedCut, OptimizationResult } from '@/types';
 
 // ── Action types ──────────────────────────────────────────────────────────────
 
@@ -177,28 +177,20 @@ function layoutReducer(state: LayoutEditorState, action: LayoutAction): LayoutEd
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
-export function useLayoutEditor(projectId: string, result: OptimizationResult | null) {
+export function useLayoutEditor(
+  projectId: string,
+  result: OptimizationResult | null,
+  initialOverrides?: ManualOverrides | null
+) {
   const [state, dispatch] = useReducer(layoutReducer, initialState);
+  const hydrated = initialOverrides !== undefined;
 
-  // Load from localStorage on mount
+  // Load the persisted override payload supplied by the project API.
   useEffect(() => {
     if (!projectId) return;
-    try {
-      const raw = localStorage.getItem(`layout-overrides-${projectId}`);
-      if (raw) {
-        const parsed = JSON.parse(raw) as ManualOverrides;
-        dispatch({ type: 'LOAD', overrides: parsed });
-      }
-    } catch { /* ignore */ }
-  }, [projectId]);
-
-  // Persist to localStorage on change
-  useEffect(() => {
-    if (!projectId) return;
-    try {
-      localStorage.setItem(`layout-overrides-${projectId}`, JSON.stringify(state.overrides));
-    } catch { /* ignore quota errors */ }
-  }, [projectId, state.overrides]);
+    if (initialOverrides === undefined) return;
+    dispatch({ type: 'LOAD', overrides: initialOverrides ?? {} });
+  }, [initialOverrides, projectId]);
 
   // Purge stale keys when cuts change
   useEffect(() => {
@@ -219,13 +211,12 @@ export function useLayoutEditor(projectId: string, result: OptimizationResult | 
       for (const key of state.selectedKeys) {
         const ov = state.overrides[key];
         // Find current position
-        let sourceX = 0, sourceY = 0, sourceRot = false, sourceSheet = 0;
+        let sourceX = 0, sourceY = 0, sourceSheet = 0;
         for (let i = 0; i < allSheets.length; i++) {
           const cut = allSheets[i].cuts.find(c => c.instanceKey === key);
           if (cut) {
             sourceX = ov?.x ?? cut.x;
             sourceY = ov?.y ?? cut.y;
-            sourceRot = ov?.rot ?? cut.rot;
             sourceSheet = ov?.sheetIndex ?? i;
             break;
           }
@@ -294,6 +285,7 @@ export function useLayoutEditor(projectId: string, result: OptimizationResult | 
   }, [state.selectedKeys]);
 
   return {
+    hydrated,
     overrides: state.overrides,
     selectedKeys: state.selectedKeys,
     canUndo: state.undoStack.length > 0,

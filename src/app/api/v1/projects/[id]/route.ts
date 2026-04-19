@@ -1,8 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
-import { projects, stocks, cuts } from '@/db/schema';
+import { projects, stocks, cuts, projectStepFiles } from '@/db/schema';
 import { eq, and } from 'drizzle-orm';
+import { deletePersistedProjectStepDirectory } from '@/server/project-step-files';
+import { dedupeStepCuts, serializeProjectDetail } from '@/server/projects';
+
+type ProjectCutInput = {
+  id?: string | null;
+  label: string;
+  l: number;
+  w: number;
+  t?: number;
+  qty: number;
+  mat: string;
+  group?: string;
+  stepFileId?: string | null;
+  stepSessionId?: string | null;
+  stepBodyIndex?: number | null;
+  stepFaceIndex?: number | null;
+};
+
+type ProjectStockInput = {
+  id?: string | null;
+  name: string;
+  l: number;
+  w: number;
+  t?: number;
+  qty: number;
+  mat: string;
+};
 
 export async function GET(
   request: NextRequest,
@@ -17,6 +44,7 @@ export async function GET(
     with: {
       stocks: true,
       cuts: true,
+      stepFiles: true,
     },
   });
 
@@ -24,7 +52,7 @@ export async function GET(
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
 
-  return NextResponse.json(project);
+  return NextResponse.json(await serializeProjectDetail(project));
 }
 
 export async function PUT(
@@ -46,7 +74,7 @@ export async function PUT(
   }
 
   // Update project metadata
-  const [updated] = await db
+  await db
     .update(projects)
     .set({
       name: body.name ?? existing.name,
@@ -56,6 +84,15 @@ export async function PUT(
       groupMultipliers: body.groupMultipliers !== undefined
         ? JSON.stringify(body.groupMultipliers)
         : existing.groupMultipliers,
+      layoutOverrides: body.layoutOverrides !== undefined
+        ? JSON.stringify(body.layoutOverrides)
+        : existing.layoutOverrides,
+      layoutExcludedKeys: body.layoutExcludedKeys !== undefined
+        ? JSON.stringify(body.layoutExcludedKeys)
+        : existing.layoutExcludedKeys,
+      layoutPadding: body.layoutPadding ?? existing.layoutPadding,
+      layoutHasActive: body.layoutHasActive ?? existing.layoutHasActive,
+      stepActiveFileId: body.stepActiveFileId ?? existing.stepActiveFileId,
       updatedAt: new Date(),
     })
     .where(eq(projects.id, id))
@@ -66,7 +103,8 @@ export async function PUT(
     await db.delete(stocks).where(eq(stocks.projectId, id));
     if (body.stocks.length) {
       await db.insert(stocks).values(
-        body.stocks.map((s: { name: string; l: number; w: number; t?: number; qty: number; mat: string }, i: number) => ({
+        (body.stocks as ProjectStockInput[]).map((s, i: number) => ({
+          id: s.id ?? crypto.randomUUID(),
           projectId: id,
           name: s.name,
           length: s.l,
@@ -82,14 +120,12 @@ export async function PUT(
 
   // If cuts were provided, replace them
   if (body.cuts) {
+    const dedupedCuts = dedupeStepCuts(body.cuts as ProjectCutInput[]);
     await db.delete(cuts).where(eq(cuts.projectId, id));
-    if (body.cuts.length) {
+    if (dedupedCuts.length) {
       await db.insert(cuts).values(
-        body.cuts.map((c: {
-          label: string; l: number; w: number; t?: number; qty: number; mat: string;
-          group?: string;
-          stepSessionId?: string; stepBodyIndex?: number; stepFaceIndex?: number;
-        }, i: number) => ({
+        dedupedCuts.map((c, i: number) => ({
+          id: c.id ?? crypto.randomUUID(),
           projectId: id,
           label: c.label,
           length: c.l,
@@ -98,6 +134,7 @@ export async function PUT(
           quantity: c.qty,
           material: c.mat || '',
           groupName: c.group || '',
+          stepFileId: c.stepFileId ?? null,
           stepSessionId: c.stepSessionId ?? null,
           stepBodyIndex: c.stepBodyIndex ?? null,
           stepFaceIndex: c.stepFaceIndex ?? null,
@@ -113,10 +150,11 @@ export async function PUT(
     with: {
       stocks: true,
       cuts: true,
+      stepFiles: true,
     },
   });
 
-  return NextResponse.json(completeProject);
+  return NextResponse.json(completeProject ? await serializeProjectDetail(completeProject) : null);
 }
 
 export async function DELETE(
@@ -138,6 +176,8 @@ export async function DELETE(
 
   // Delete project (cascades to stocks and cuts)
   await db.delete(projects).where(eq(projects.id, id));
+  await db.delete(projectStepFiles).where(eq(projectStepFiles.projectId, id));
+  await deletePersistedProjectStepDirectory(id);
 
   return new NextResponse(null, { status: 204 });
 }

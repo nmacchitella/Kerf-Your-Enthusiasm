@@ -497,6 +497,30 @@ console.log('\nTest 21: Re-optimize with two free cuts next to a non-corner pinn
   validateResult(r, kerf, 'subtract-no-corner-overlap');
 }
 
+// ─── Test 22: Sheet edge padding reserves the border ─────────────────────
+
+console.log('\nTest 22: Sheet edge padding keeps the outer border clear');
+{
+  const edgePadding = 0.75;
+  const exactFit: Cut[] = [{ id: 1, label: 'Inset', l: 94.5, w: 46.5, t: 0.75, qty: 1, mat: 'plywood' }];
+  const exactFitResult = optimizeCutsBest([STOCK_PLYWOOD], exactFit, 0.125, 0, [], [], edgePadding);
+  assertEq(exactFitResult.unplaced.length, 0, 'cut that matches the usable inset area is placed');
+  assertEq(exactFitResult.sheets.length, 1, 'usable-area cut uses one sheet');
+  if (exactFitResult.sheets.length > 0 && exactFitResult.sheets[0].cuts.length > 0) {
+    const c = exactFitResult.sheets[0].cuts[0];
+    assertEq(c.x, edgePadding, 'cut starts after left border padding');
+    assertEq(c.y, edgePadding, 'cut starts after top border padding');
+    assertEq(c.x + c.pw, exactFitResult.sheets[0].w - edgePadding, 'cut ends before right border padding');
+    assertEq(c.y + c.ph, exactFitResult.sheets[0].l - edgePadding, 'cut ends before bottom border padding');
+  }
+  validateResult(exactFitResult, 0.125, 'sheet-edge-padding');
+
+  const tooWide: Cut[] = [{ id: 2, label: 'TooWide', l: 20, w: 47, t: 0.75, qty: 1, mat: 'plywood' }];
+  const tooWideResult = optimizeCutsBest([STOCK_PLYWOOD], tooWide, 0.125, 0, [], [], edgePadding);
+  assertEq(tooWideResult.unplaced.length, 1, 'cut wider than the usable inset area is rejected');
+  assertEq(tooWideResult.sheets.length, 0, 'no sheet generated when only cut exceeds inset width');
+}
+
 // ─── Summary ──────────────────────────────────────────────────────────────
 
 console.log('\n─────────────────────────────────────────');

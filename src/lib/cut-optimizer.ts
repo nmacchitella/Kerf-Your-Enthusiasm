@@ -325,23 +325,46 @@ function sortCuts(cuts: Cut[]): Cut[] {
   });
 }
 
+function getUsableSheetRect(stock: Stock, sheetEdgePadding: number): Rect | null {
+  const inset = Math.max(sheetEdgePadding, 0);
+  const usableW = stock.w - inset * 2;
+  const usableH = stock.l - inset * 2;
+
+  if (usableW <= 0 || usableH <= 0) return null;
+
+  return {
+    x: inset,
+    y: inset,
+    w: usableW,
+    h: usableH,
+  };
+}
+
 /**
  * Check if a stock can fit a cut (accounting for kerf properly)
  * t=0 means "unspecified thickness" — matches any stock
  */
-function stockCanFitCut(stock: Stock, cut: Cut): boolean {
+function stockCanFitCut(stock: Stock, cut: Cut, sheetEdgePadding: number = 0): boolean {
   const thicknessOk =
     (stock.t ?? 0) === 0 || (cut.t ?? 0) === 0 ||
     Math.abs((stock.t ?? 0) - (cut.t ?? 0)) < 0.001;
   if (!thicknessOk) return false;
-  return (cut.w <= stock.w && cut.l <= stock.l) ||
-         (cut.l <= stock.w && cut.w <= stock.l);
+  const usableRect = getUsableSheetRect(stock, sheetEdgePadding);
+  if (!usableRect) return false;
+
+  return (cut.w <= usableRect.w && cut.l <= usableRect.h) ||
+         (cut.l <= usableRect.w && cut.w <= usableRect.h);
 }
 
 /**
  * Select the best stock for remaining cuts
  */
-function selectBestStock(stocks: Stock[], remainingCuts: Cut[], stockUsage: Map<number, number>): Stock | null {
+function selectBestStock(
+  stocks: Stock[],
+  remainingCuts: Cut[],
+  stockUsage: Map<number, number>,
+  sheetEdgePadding: number = 0
+): Stock | null {
   console.log('  selectBestStock called with', stocks.length, 'stocks and', remainingCuts.length, 'remaining cuts');
 
   if (remainingCuts.length === 0) return null;
@@ -361,7 +384,7 @@ function selectBestStock(stocks: Stock[], remainingCuts: Cut[], stockUsage: Map<
       const cMat = cut.mat || '';
       const sMat = s.mat || '';
       if (cMat && sMat && cMat !== sMat) return false;
-      return stockCanFitCut(s, cut);
+      return stockCanFitCut(s, cut, sheetEdgePadding);
     });
     console.log(`    Stock ${s.name} (${s.w}×${s.l}) qty:${available}/${s.qty ?? 1} canFitAny: ${canFitAny}`);
     return canFitAny;
@@ -381,15 +404,16 @@ function selectBestStock(stocks: Stock[], remainingCuts: Cut[], stockUsage: Map<
       const sMat = stock.mat || '';
       if (cMat && sMat && cMat !== sMat) continue;
 
-      if (stockCanFitCut(stock, cut)) {
+      if (stockCanFitCut(stock, cut, sheetEdgePadding)) {
         fittableCuts++;
         totalCutArea += cut.w * cut.l;
       }
     }
 
-    const stockArea = stock.w * stock.l;
+    const usableRect = getUsableSheetRect(stock, sheetEdgePadding);
+    const stockArea = usableRect ? usableRect.w * usableRect.h : 0;
     // DON'T cap at 1 - we need to know if cuts exceed stock capacity
-    const fillRatio = totalCutArea / stockArea;
+    const fillRatio = stockArea > 0 ? totalCutArea / stockArea : Number.POSITIVE_INFINITY;
     // Can all cuts potentially fit? (with ~20% margin for kerf/waste)
     const canFitAll = fillRatio <= 0.85;
 
@@ -434,15 +458,17 @@ function packSheet(
   cuts: Cut[],
   kerf: number,
   forceFirstRotation?: boolean,
-  pinnedOnThisSheet?: PlacedCut[]
+  pinnedOnThisSheet?: PlacedCut[],
+  sheetEdgePadding: number = 0
 ): { sheet: Sheet; placed: Cut[]; unplaced: Cut[] } {
+  const initialRect = getUsableSheetRect(stock, sheetEdgePadding);
   const sheet: Sheet = {
     w: stock.w,
     l: stock.l,
     name: stock.name,
     mat: stock.mat,
     cuts: [],
-    rects: [{ x: 0, y: 0, w: stock.w, h: stock.l }],
+    rects: initialRect ? [initialRect] : [],
   };
 
   // Pre-occupy space for pinned parts using MaxRects-style subtraction.
@@ -529,7 +555,8 @@ function packSheet(
 export function optimizeCuts(
   stocks: Stock[],
   cuts: Cut[],
-  kerf: number
+  kerf: number,
+  sheetEdgePadding: number = 0
 ): OptimizationResult {
   console.group('🪚 Cut Optimizer - Guillotine');
   console.log('Input stocks:', stocks.map(s => `${s.name} (${s.w}×${s.l})`));
@@ -548,13 +575,13 @@ export function optimizeCuts(
   let sheetCount = 0;
 
   while (remaining.length > 0 && sheetCount < 50) {
-    const stock = selectBestStock(stocks, remaining, stockUsage);
+    const stock = selectBestStock(stocks, remaining, stockUsage, sheetEdgePadding);
     console.log(`Sheet ${sheetCount + 1}: Selected stock:`, stock ? `${stock.name} (${stock.w}×${stock.l})` : 'NONE');
     if (!stock) break;
 
     // Try both orientations for the first cut and pick the better result
-    const resultNormal = packSheet(stock, remaining, kerf, false);
-    const resultRotated = packSheet(stock, remaining, kerf, true);
+    const resultNormal = packSheet(stock, remaining, kerf, false, undefined, sheetEdgePadding);
+    const resultRotated = packSheet(stock, remaining, kerf, true, undefined, sheetEdgePadding);
 
     // Pick the one that places more cuts (or has less unplaced)
     let bestResult = resultNormal;
@@ -602,7 +629,8 @@ export function optimizeCuts(
 export function optimizeCutsShelf(
   stocks: Stock[],
   cuts: Cut[],
-  kerf: number
+  kerf: number,
+  sheetEdgePadding: number = 0
 ): OptimizationResult {
   const results: Sheet[] = [];
   const stockUsage = new Map<number, number>();
@@ -616,11 +644,18 @@ export function optimizeCutsShelf(
   let sheetCount = 0;
 
   while (remaining.length > 0 && sheetCount < 50) {
-    const stock = selectBestStock(stocks, remaining, stockUsage);
+    const stock = selectBestStock(stocks, remaining, stockUsage, sheetEdgePadding);
     if (!stock) break;
 
     // Track stock usage
     stockUsage.set(stock.id, (stockUsage.get(stock.id) || 0) + 1);
+
+    const usableRect = getUsableSheetRect(stock, sheetEdgePadding);
+    if (!usableRect) break;
+    const minX = usableRect.x;
+    const minY = usableRect.y;
+    const maxX = usableRect.x + usableRect.w;
+    const maxY = usableRect.y + usableRect.h;
 
     const sheet: Sheet = {
       w: stock.w,
@@ -631,8 +666,8 @@ export function optimizeCutsShelf(
       rects: [],
     };
 
-    let currentY = 0;
-    let currentX = 0;
+    let currentY = minY;
+    let currentX = minX;
     let shelfHeight = 0;
     const left: Cut[] = [];
 
@@ -663,18 +698,18 @@ export function optimizeCutsShelf(
       }
 
       // Check if we need to rotate to fit width
-      if (currentX + pw > stock.w && currentX + ph <= stock.w) {
+      if (currentX + pw > maxX && currentX + ph <= maxX) {
         const temp = pw;
         pw = ph;
         ph = temp;
         rotated = !rotated;
       }
 
-      const needsKerfX = currentX > 0 ? kerf : 0;
-      const needsKerfY = currentY > 0 ? kerf : 0;
+      const needsKerfX = currentX > minX ? kerf : 0;
+      const needsKerfY = currentY > minY ? kerf : 0;
 
       // Try current shelf
-      if (currentX + needsKerfX + pw <= stock.w && currentY + needsKerfY + ph <= stock.l) {
+      if (currentX + needsKerfX + pw <= maxX && currentY + needsKerfY + ph <= maxY) {
         sheet.cuts.push({
           ...c,
           x: currentX + needsKerfX,
@@ -688,22 +723,22 @@ export function optimizeCutsShelf(
         shelfHeight = Math.max(shelfHeight, ph);
       }
       // Try new shelf
-      else if (currentY + shelfHeight + kerf + ph <= stock.l) {
+      else if (currentY + shelfHeight + kerf + ph <= maxY) {
         currentY += shelfHeight + kerf;
-        currentX = 0;
+        currentX = minX;
         shelfHeight = 0;
 
-        if (pw <= stock.w && currentY + ph <= stock.l) {
+        if (currentX + pw <= maxX && currentY + ph <= maxY) {
           sheet.cuts.push({
             ...c,
-            x: 0,
+            x: currentX,
             y: currentY,
             pw,
             ph,
             rot: rotated,
             instanceKey: (c as Cut & { instanceKey?: string }).instanceKey ?? makeInstanceKey(c.id, 0),
           });
-          currentX = pw;
+          currentX += pw;
           shelfHeight = ph;
         } else {
           left.push(c);
@@ -737,7 +772,8 @@ export function optimizeCutsShelf(
 export function optimizeCutsMaxRects(
   stocks: Stock[],
   cuts: Cut[],
-  kerf: number
+  kerf: number,
+  sheetEdgePadding: number = 0
 ): OptimizationResult {
   const results: Sheet[] = [];
   const stockUsage = new Map<number, number>();
@@ -748,8 +784,10 @@ export function optimizeCutsMaxRects(
   let sheetCount = 0;
 
   while (remaining.length > 0 && sheetCount < 50) {
-    const stock = selectBestStock(stocks, remaining, stockUsage);
+    const stock = selectBestStock(stocks, remaining, stockUsage, sheetEdgePadding);
     if (!stock) break;
+    const usableRect = getUsableSheetRect(stock, sheetEdgePadding);
+    if (!usableRect) break;
 
     // Split remaining cuts into eligible (match this stock) and ineligible
     const eligible: Cut[] = [];
@@ -781,8 +819,8 @@ export function optimizeCutsMaxRects(
     const trulyIneligible: Cut[] = [];
 
     for (const c of eligible) {
-      const normalFits  = c.w <= stock.w && c.l <= stock.l;
-      const rotatedFits = c.l <= stock.w && c.w <= stock.l;
+      const normalFits  = c.w <= usableRect.w && c.l <= usableRect.h;
+      const rotatedFits = c.l <= usableRect.w && c.w <= usableRect.h;
       if (normalFits) {
         packerInputs.push({ width: c.w, height: c.l, cut: c, preRotated: false });
       } else if (rotatedFits) {
@@ -797,7 +835,7 @@ export function optimizeCutsMaxRects(
     let bestSheet: Sheet | null = null;
 
     for (const logic of [PACKING_LOGIC.MAX_EDGE, PACKING_LOGIC.MAX_AREA] as const) {
-      const packer = new MaxRectsPacker(stock.w, stock.l, kerf, {
+      const packer = new MaxRectsPacker(usableRect.w, usableRect.h, kerf, {
         smart: false,
         pot: false,
         square: false,
@@ -828,8 +866,8 @@ export function optimizeCutsMaxRects(
             const overallRot = input.preRotated !== r.rot;
             const pw = r.width;
             const ph = r.height;
-            const x = r.x;
-            const y = r.y;
+            const x = usableRect.x + r.x;
+            const y = usableRect.y + r.y;
             return {
               ...input.cut,
               x, y, pw, ph,
@@ -1072,7 +1110,8 @@ export function optimizeCutsOptimal(
   stocks: Stock[],
   cuts: Cut[],
   kerf: number,
-  timeLimit: number = 2000 // 2 second default timeout
+  timeLimit: number = 2000, // 2 second default timeout
+  sheetEdgePadding: number = 0
 ): OptimizationResult {
   console.group('🎯 Cut Optimizer - Branch & Bound (Optimal)');
   console.log('Input stocks:', stocks.map(s => `${s.name} (${s.w}×${s.l})`));
@@ -1094,8 +1133,10 @@ export function optimizeCutsOptimal(
   const startTime = Date.now();
 
   while (remaining.length > 0 && sheetCount < 50) {
-    const stock = selectBestStock(stocks, remaining, stockUsage);
+    const stock = selectBestStock(stocks, remaining, stockUsage, sheetEdgePadding);
     if (!stock) break;
+    const usableRect = getUsableSheetRect(stock, sheetEdgePadding);
+    if (!usableRect) break;
 
     console.log(`Sheet ${sheetCount + 1}: Searching optimal layout for ${stock.name} (${stock.w}×${stock.l})...`);
 
@@ -1113,10 +1154,10 @@ export function optimizeCutsOptimal(
 
     // Initial state for this sheet
     const initialState: SearchState = {
-      rects: [{ x: 0, y: 0, w: stock.w, h: stock.l }],
+      rects: [usableRect],
       placed: [],
       remaining: eligibleForStock,
-      totalArea: stock.w * stock.l,
+      totalArea: usableRect.w * usableRect.h,
       usedArea: 0,
     };
 
@@ -1233,11 +1274,23 @@ export function optimizeCutsBest(
   kerf: number,
   padding: number = 0,
   pinnedPlacements: PinnedPlacement[] = [],
-  sheetAssignments: SheetAssignment[] = []
+  sheetAssignments: SheetAssignment[] = [],
+  sheetEdgePadding: number = 0
 ): OptimizationResult {
   console.log('═══════════════════════════════════════════════════════════');
   console.log('🪵 OPTIMIZE CUTS BEST - Starting optimization');
-  console.log('Kerf:', kerf, '| Padding:', padding, '| Pinned:', pinnedPlacements.length, '| Assigned:', sheetAssignments.length);
+  console.log(
+    'Kerf:',
+    kerf,
+    '| Padding:',
+    padding,
+    '| Sheet Edge Padding:',
+    sheetEdgePadding,
+    '| Pinned:',
+    pinnedPlacements.length,
+    '| Assigned:',
+    sheetAssignments.length
+  );
   console.log('═══════════════════════════════════════════════════════════');
 
   // Keys to exclude from free packing (already pinned or manually assigned)
@@ -1305,7 +1358,7 @@ export function optimizeCutsBest(
         stockUsage.set(stock.id, used + 1);
       }
 
-      const { sheet, placed } = packSheet(stock, cutsForThisSheet, kerf, undefined, pinnedCuts);
+      const { sheet, placed } = packSheet(stock, cutsForThisSheet, kerf, undefined, pinnedCuts, sheetEdgePadding);
       resultSheets.push(sheet);
       handledSheetIndices.add(sheetIdx);
 
@@ -1319,7 +1372,7 @@ export function optimizeCutsBest(
       // Re-aggregate free cuts back into qty>1 form for the algorithms
       // (they re-expand internally via expandCutsWithKeys)
       // Since freeCuts are already expanded, pass them as qty=1 each
-      const freeResult = optimizeCutsBest(stocks, freeCuts, kerf, 0, [], []);
+      const freeResult = optimizeCutsBest(stocks, freeCuts, kerf, 0, [], [], sheetEdgePadding);
       resultSheets.push(...freeResult.sheets);
 
       const deflated = padding > 0
@@ -1352,14 +1405,14 @@ export function optimizeCutsBest(
   const totalCuts = effectiveCuts.reduce((sum, c) => sum + c.qty, 0);
 
   // Run all algorithms
-  const guillotine = optimizeCuts(stocks, effectiveCuts, kerf);
-  const shelf = optimizeCutsShelf(stocks, effectiveCuts, kerf);
-  const maxrects = optimizeCutsMaxRects(stocks, effectiveCuts, kerf);
+  const guillotine = optimizeCuts(stocks, effectiveCuts, kerf, sheetEdgePadding);
+  const shelf = optimizeCutsShelf(stocks, effectiveCuts, kerf, sheetEdgePadding);
+  const maxrects = optimizeCutsMaxRects(stocks, effectiveCuts, kerf, sheetEdgePadding);
 
   // Branch-and-bound is exponential — only useful for small inputs
   const timeLimit = totalCuts <= 10 ? 3000 : 2000;
   const optimal = totalCuts <= 15
-    ? optimizeCutsOptimal(stocks, effectiveCuts, kerf, timeLimit)
+    ? optimizeCutsOptimal(stocks, effectiveCuts, kerf, timeLimit, sheetEdgePadding)
     : null;
 
   const gStats = calculateStats(guillotine);

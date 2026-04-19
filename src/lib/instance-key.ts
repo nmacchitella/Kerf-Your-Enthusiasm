@@ -2,18 +2,19 @@ import type { Cut, PartInstanceKey } from '@/types';
 
 /**
  * Create a stable, unique key for a specific instance of a cut.
- * Format: `${cut.id}-${instanceIndex}` where instanceIndex is 0-based within qty.
- * The cut.id here should be the DB-sourced id for stability across re-optimizes.
+ * Format: `${cutId}-${instanceIndex}` where instanceIndex is 0-based within qty.
+ * Prefer a DB-backed id for stability across re-optimizes and saves.
  */
-export function makeInstanceKey(cutId: number, instanceIndex: number): PartInstanceKey {
+export function makeInstanceKey(cutId: string | number, instanceIndex: number): PartInstanceKey {
   return `${cutId}-${instanceIndex}`;
 }
 
 /**
  * Parse the cutId portion out of an instance key.
  */
-export function keyToCutId(key: PartInstanceKey): number {
-  return parseInt(key.split('-')[0], 10);
+export function keyToCutId(key: PartInstanceKey): string {
+  const match = key.match(/^(.*)-(\d+)$/);
+  return match ? match[1] : key;
 }
 
 /**
@@ -32,7 +33,7 @@ export function expandCutsWithKeys(cuts: Cut[]): Array<Cut & { instanceKey: Part
       continue;
     }
     for (let i = 0; i < cut.qty; i++) {
-      result.push({ ...cut, qty: 1, instanceKey: makeInstanceKey(cut.id, i) });
+      result.push({ ...cut, qty: 1, instanceKey: makeInstanceKey(cut.dbId ?? cut.id, i) });
     }
   }
   return result;

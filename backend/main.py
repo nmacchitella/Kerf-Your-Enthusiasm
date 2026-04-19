@@ -120,12 +120,29 @@ async def get_bodies(session_id: str):
     return {"bodies": _bodies_to_json(bodies)}
 
 
+@app.get("/session/{session_id}/file")
+async def get_session_file(session_id: str):
+    """Download the raw STEP file for a session."""
+    step_path = session_mgr.session_step_path(session_id)
+    if not step_path.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    filename = f"{session_id}.step"
+    return FileResponse(
+        path=step_path,
+        media_type="application/octet-stream",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 class ExportRequest(BaseModel):
     session_id: str
     body_index: int
     body_name: str
     face_index: int
     face_centroid: list[float] | None = None  # 3D centroid for reliable face matching
+    layer_style: str | None = None
 
 
 @app.post("/export")
@@ -170,6 +187,7 @@ async def export_dxf(req: ExportRequest):
             face_index=resolved_index,
             output_dir=out_dir,
             body_name=req.body_name,
+            layer_style=req.layer_style or "default",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DXF export failed: {e}")
@@ -269,8 +287,9 @@ async def preview_projection(req: PreviewRequest):
         raise HTTPException(status_code=400, detail=f"Face {resolved_index} is not planar")
 
     try:
-        from projection import project_body_orthographic
-        edge_data = project_body_orthographic(body["shape"], resolved_index)
+        from projection import collapse_closed_line_loops, project_body_orthographic
+        edge_data = project_body_orthographic(body["shape"], resolved_index, reference_mode="selected")
+        edge_data = {**edge_data, "edges": collapse_closed_line_loops(edge_data.get("edges", []))}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Projection failed: {e}")
 
@@ -314,6 +333,7 @@ class SheetExportRequest(BaseModel):
     sheet_name: str = "Sheet"
     placements: List[SheetPlacement]
     rect_placements: List[RectPlacement] = []
+    layer_style: str | None = None
 
 
 @app.post("/export/sheet")
@@ -383,6 +403,7 @@ async def export_sheet_dxf(req: SheetExportRequest):
             sheet_name=req.sheet_name,
             placements=enriched_placements,
             rect_placements=[p.model_dump() for p in req.rect_placements],
+            layer_style=req.layer_style or "default",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sheet DXF export failed: {e}")
@@ -450,6 +471,7 @@ async def preview_sheet(req: SheetExportRequest):
             sheet_length_mm=req.sheet_length_mm,
             placements=enriched_placements,
             rect_placements=[p.model_dump() for p in req.rect_placements],
+            layer_style=req.layer_style or "default",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sheet preview failed: {e}")

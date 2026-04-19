@@ -3,6 +3,7 @@ export type UnitSystem = 'in' | 'mm';
 // Stock sheet for cut optimization
 export interface Stock {
   id: number;
+  dbId?: string;
   name: string;
   l: number;  // length in project units
   w: number;  // width in project units
@@ -14,6 +15,7 @@ export interface Stock {
 // Part/cut to be made
 export interface Cut {
   id: number;
+  dbId?: string;
   label: string;
   l: number;  // length in project units
   w: number;  // width in project units
@@ -21,6 +23,7 @@ export interface Cut {
   qty: number;
   mat: string;
   group?: string;  // UI grouping label (no structural effect)
+  stepFileId?: string;
   stepSessionId?: string;
   stepBodyIndex?: number;
   stepFaceIndex?: number;

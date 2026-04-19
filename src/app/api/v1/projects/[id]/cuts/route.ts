@@ -3,6 +3,7 @@ import { getDevSession } from '@/lib/dev-session';
 import { db } from '@/db';
 import { projects, cuts } from '@/db/schema';
 import { eq, and, max } from 'drizzle-orm';
+import { getStepCutDedupKey } from '@/server/projects';
 
 export async function POST(
   request: NextRequest,
@@ -23,11 +24,45 @@ export async function POST(
   const newCuts: {
     label: string; l: number; w: number; t?: number; qty: number; mat: string;
     group?: string;
+    stepFileId?: string;
     stepSessionId?: string; stepBodyIndex?: number; stepFaceIndex?: number;
   }[] = body.cuts ?? [];
 
   if (!newCuts.length) {
     return NextResponse.json({ added: 0 });
+  }
+
+  const existingStepCuts = await db.query.cuts.findMany({
+    where: eq(cuts.projectId, id),
+    columns: {
+      stepFileId: true,
+      stepSessionId: true,
+      stepBodyIndex: true,
+      stepFaceIndex: true,
+    },
+  });
+
+  const existingStepKeys = new Set(
+    existingStepCuts
+      .map((cut) => getStepCutDedupKey(cut))
+      .filter((key): key is string => Boolean(key))
+  );
+
+  const dedupedCuts = newCuts.filter((cut) => {
+    const key = getStepCutDedupKey(cut);
+    if (!key) {
+      return true;
+    }
+    if (existingStepKeys.has(key)) {
+      return false;
+    }
+
+    existingStepKeys.add(key);
+    return true;
+  });
+
+  if (!dedupedCuts.length) {
+    return NextResponse.json({ added: 0, skipped: newCuts.length }, { status: 200 });
   }
 
   // Find current max sortOrder so appended items follow existing ones
@@ -39,7 +74,7 @@ export async function POST(
   const startOrder = (maxOrder ?? -1) + 1;
 
   await db.insert(cuts).values(
-    newCuts.map((c, i) => ({
+    dedupedCuts.map((c, i) => ({
       projectId: id,
       label: c.label,
       length: c.l,
@@ -48,6 +83,7 @@ export async function POST(
       quantity: c.qty,
       material: c.mat || '',
       groupName: c.group || '',
+      stepFileId: c.stepFileId ?? null,
       stepSessionId: c.stepSessionId ?? null,
       stepBodyIndex: c.stepBodyIndex ?? null,
       stepFaceIndex: c.stepFaceIndex ?? null,
@@ -55,5 +91,8 @@ export async function POST(
     }))
   );
 
-  return NextResponse.json({ added: newCuts.length }, { status: 201 });
+  return NextResponse.json(
+    { added: dedupedCuts.length, skipped: newCuts.length - dedupedCuts.length },
+    { status: 201 }
+  );
 }

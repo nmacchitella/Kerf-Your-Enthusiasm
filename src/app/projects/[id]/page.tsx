@@ -7,9 +7,17 @@ import { optimizeCutsBest, calculateStats } from '@/lib/cut-optimizer';
 import { toFraction } from '@/lib/fraction-utils';
 import { STOCK_PRESETS, MATERIALS, KERF_PRESETS, CUT_COLORS } from '@/lib/constants';
 import { UnitToggle } from '@/components/ui/UnitToggle';
-import { inToMM } from '@/lib/unit-utils';
+import { inToMM, mmToIn } from '@/lib/unit-utils';
 import { jsPDF } from 'jspdf';
-import type { Stock as StockType, Cut as CutType, OptimizationResult, UnitSystem, PartInstanceKey } from '@/types';
+import type {
+  Stock as StockType,
+  Cut as CutType,
+  OptimizationResult,
+  UnitSystem,
+  PartInstanceKey,
+  PlacedCut,
+  ManualOverrides,
+} from '@/types';
 import { useLayoutEditor } from '@/hooks/useLayoutEditor';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { buildPinnedPlacements, buildSheetAssignments, buildMergedSheet } from '@/lib/layout-utils';
@@ -36,9 +44,28 @@ interface DBCut {
   quantity: number;
   material: string;
   groupName?: string | null;
+  stepFileId?: string | null;
   stepSessionId?: string | null;
   stepBodyIndex?: number | null;
   stepFaceIndex?: number | null;
+}
+
+interface DBStepBodyState {
+  bodyIndex: number;
+  name: string;
+  included: boolean;
+  confirmed: boolean;
+  selectedFaceIndex?: number;
+}
+
+interface DBStepFile {
+  id: string;
+  filename: string;
+  fileSize: number;
+  selectedBodyIndex: number;
+  sortOrder: number;
+  bodyState: DBStepBodyState[];
+  sessionId: string | null;
 }
 
 interface Project {
@@ -48,13 +75,283 @@ interface Project {
   kerf: number;
   units: string | null;
   groupMultipliers: string | null;
+  layoutOverrides: Record<string, unknown>;
+  layoutExcludedKeys: string[];
+  layoutPadding: number;
+  layoutHasActive: boolean;
+  stepActiveFileId?: string | null;
   stocks: DBStock[];
   cuts: DBCut[];
+  stepFiles: DBStepFile[];
+}
+
+interface NumberedPlacedCut extends PlacedCut {
+  partNumber: number;
+}
+
+interface SheetExportPayload {
+  session_id: string;
+  sheet_width_mm: number;
+  sheet_length_mm: number;
+  sheet_name: string;
+  placements: Array<{
+    body_index: number;
+    face_index: number;
+    body_name: string;
+    x_mm: number;
+    y_mm: number;
+    rot: boolean;
+    session_id: string;
+  }>;
+  rect_placements: Array<{
+    body_name: string;
+    x_mm: number;
+    y_mm: number;
+    w_mm: number;
+    h_mm: number;
+  }>;
+}
+
+type SheetLayerStyle = 'default' | 'vcarve';
+
+interface PartLabelSource {
+  label: string;
+  group?: string;
+  stepFileId?: string | null;
+  stepSessionId?: string | null;
+}
+
+interface PartPreviewData {
+  edges: SheetPreviewData['edges'];
+  face_dims_mm?: [number, number, number] | null;
+}
+
+interface PartOperationSummary {
+  hasHoles: boolean;
+  depthsMm: number[];
+  thicknessMm: number | null;
+}
+
+function sanitizeFilenameSegment(value: string, fallback: string): string {
+  const cleaned = value
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return cleaned || fallback;
+}
+
+function stripStepFilenameSuffix(value: string): string {
+  return value.replace(/\.(step|stp)$/i, '').trim();
+}
+
+function buildStepFilenameMap(stepFiles: DBStepFile[]): Map<string, string> {
+  return new Map(stepFiles.map((stepFile) => [stepFile.id, stepFile.filename]));
+}
+
+function buildStepSessionMap(stepFiles: DBStepFile[]): Map<string, string> {
+  return new Map(
+    stepFiles
+      .filter((stepFile): stepFile is DBStepFile & { sessionId: string } => Boolean(stepFile.sessionId))
+      .map((stepFile) => [stepFile.id, stepFile.sessionId])
+  );
+}
+
+function buildSheetDxfFilename(
+  sheetIdx: number,
+  sheetName: string,
+  layerStyle: SheetLayerStyle = 'default'
+): string {
+  const stem = `Sheet_${sheetIdx + 1}_${sanitizeFilenameSegment(sheetName, 'sheet')}`;
+  return layerStyle === 'vcarve' ? `${stem}_vcarve.dxf` : `${stem}.dxf`;
+}
+
+function buildVcarveReadme(projectName: string): string {
+  return [
+    `${projectName} - VCarve DXF Export`,
+    '',
+    'These DXFs represent the current optimized sheet layout from Kerfuffle.',
+    'The files use VCarve-oriented layer names so you can map template toolpaths by layer.',
+    '',
+    'Current layer mapping:',
+    '- OUTSIDE_PROFILE: outside/profile cuts',
+    '- INTERIOR_OPENINGS: interior cut-through openings',
+    '- POCKET_*MM: pocket geometry by depth in millimeters',
+    '- SHEET_BOUNDARY: stock outline',
+    '- LABELS: part labels',
+    '',
+    'Suggested VCarve template setup:',
+    '- Profile toolpath selecting OUTSIDE_PROFILE',
+    '- Profile or drill toolpath selecting INTERIOR_OPENINGS as needed',
+    '- Pocket toolpaths selecting each POCKET_*MM layer',
+  ].join('\n');
+}
+
+function buildExportPartLabel(cut: PartLabelSource, stepFilenameMap: Map<string, string>): string {
+  const partName = cut.label.trim();
+  const sourceName = stripStepFilenameSuffix(
+    cut.stepFileId
+      ? stepFilenameMap.get(cut.stepFileId) ?? ''
+      : cut.group ?? ''
+  );
+
+  if (!sourceName) return partName || 'Part';
+  if (!partName) return sourceName;
+
+  const normalizedSource = sourceName.toLowerCase();
+  const normalizedPart = partName.toLowerCase();
+  if (normalizedPart === normalizedSource || normalizedPart.startsWith(`${normalizedSource} - `)) {
+    return partName;
+  }
+
+  return `${sourceName} - ${partName}`;
+}
+
+function parseDepthLayerMm(layer?: string): number | null {
+  const match = layer?.match(/^DEPTH_([0-9]+(?:\.[0-9]+)?)mm$/);
+  if (!match) return null;
+  const parsed = Number.parseFloat(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeThicknessMm(thicknessMm?: number | null): number | null {
+  return thicknessMm && Number.isFinite(thicknessMm) && thicknessMm > 0 ? thicknessMm : null;
+}
+
+function depthMatchesThickness(depthMm: number, thicknessMm?: number | null): boolean {
+  const normalizedThickness = normalizeThicknessMm(thicknessMm);
+  if (normalizedThickness === null) return false;
+  return Math.abs(depthMm - normalizedThickness) <= 0.1;
+}
+
+function summarizeOperationLayers(
+  edges: Array<{ layer?: string }>,
+  thicknessMm?: number | null
+): PartOperationSummary {
+  const depthSet = new Set<number>();
+  let hasHoles = false;
+
+  for (const edge of edges) {
+    if (edge.layer === 'HOLES') {
+      hasHoles = true;
+    }
+    const depthMm = parseDepthLayerMm(edge.layer);
+    if (depthMm !== null) {
+      depthSet.add(depthMm);
+    }
+  }
+
+  const sortedDepths = [...depthSet].sort((a, b) => a - b);
+  const normalizedThickness = normalizeThicknessMm(thicknessMm);
+
+  return {
+    hasHoles,
+    depthsMm: sortedDepths.filter((depthMm) => !depthMatchesThickness(depthMm, normalizedThickness)),
+    thicknessMm: normalizedThickness,
+  };
+}
+
+function mergeOperationSummaries(summaries: Array<PartOperationSummary | null>): PartOperationSummary {
+  const depthSet = new Set<number>();
+  let hasHoles = false;
+
+  for (const summary of summaries) {
+    if (!summary) continue;
+    if (summary.hasHoles) hasHoles = true;
+    summary.depthsMm.forEach((depth) => depthSet.add(depth));
+  }
+
+  return {
+    hasHoles,
+    depthsMm: [...depthSet].sort((a, b) => a - b),
+    thicknessMm: null,
+  };
+}
+
+function formatOperationDepth(depthMm: number, units: UnitSystem): string {
+  return units === 'mm'
+    ? `${depthMm.toFixed(1)} mm`
+    : `${mmToIn(depthMm).toFixed(3)} in (${depthMm.toFixed(1)} mm)`;
+}
+
+function formatPartThickness(thicknessMm: number, units: UnitSystem): string {
+  return units === 'mm'
+    ? thicknessMm.toFixed(1)
+    : toFraction(mmToIn(thicknessMm));
+}
+
+function buildOperationLines(
+  cut: PartLabelSource,
+  summary: PartOperationSummary | null,
+  units: UnitSystem
+): string[] {
+  if (!cut.stepFileId && !cut.stepSessionId) return [];
+  if (!summary) return ['Ops unavailable'];
+  if (!summary.hasHoles && summary.depthsMm.length === 0) return ['Profile only'];
+
+  const lines: string[] = [];
+  if (summary.hasHoles) {
+    lines.push('Holes');
+  }
+  if (summary.depthsMm.length === 1) {
+    lines.push(`Pocket depth: ${formatOperationDepth(summary.depthsMm[0], units)}`);
+  } else if (summary.depthsMm.length > 1) {
+    lines.push(`Pocket depths: ${summary.depthsMm.map((depth) => formatOperationDepth(depth, units)).join(', ')}`);
+  }
+  return lines;
+}
+
+function buildSheetOperationText(summary: PartOperationSummary, units: UnitSystem): string {
+  const parts = ['Profiles'];
+  if (summary.hasHoles) {
+    parts.push('holes');
+  }
+  if (summary.depthsMm.length === 1) {
+    parts.push(`pocket ${formatOperationDepth(summary.depthsMm[0], units)}`);
+  } else if (summary.depthsMm.length > 1) {
+    parts.push(`pockets ${summary.depthsMm.map((depth) => formatOperationDepth(depth, units)).join(', ')}`);
+  }
+  return parts.join(' · ');
+}
+
+function getPartThicknessDisplay(
+  cut: Pick<PlacedCut, 't'>,
+  summary: PartOperationSummary | null,
+  units: UnitSystem
+): string {
+  if (summary?.thicknessMm) {
+    return formatPartThickness(summary.thicknessMm, units);
+  }
+  if (cut.t > 0) {
+    return units === 'mm' ? cut.t.toFixed(1) : toFraction(cut.t);
+  }
+  return '';
+}
+
+function getPdfLayerColor(layer?: string): [number, number, number] {
+  if (layer === 'SHEET_BOUNDARY') return [148, 163, 184];
+  if (layer === 'HOLES') return [220, 38, 38];
+  if (layer?.startsWith('DEPTH_')) return [37, 99, 235];
+  return [15, 23, 42];
+}
+
+function getPdfLayerLineWidth(layer?: string): number {
+  if (layer === 'SHEET_BOUNDARY') return 1.1;
+  if (layer?.startsWith('DEPTH_')) return 0.55;
+  return 0.72;
+}
+
+function getPdfLayerDrawPriority(layer?: string): number {
+  if (layer === 'SHEET_BOUNDARY') return 0;
+  if (layer?.startsWith('DEPTH_')) return 1;
+  if (!layer || layer === 'PROFILE') return 2;
+  if (layer === 'HOLES') return 3;
+  return 1;
 }
 
 function toAppStock(s: DBStock, index: number): StockType {
   return {
     id: index + 1,
+    dbId: s.id,
     name: s.name,
     l: s.length,
     w: s.width,
@@ -67,6 +364,7 @@ function toAppStock(s: DBStock, index: number): StockType {
 function toAppCut(c: DBCut, index: number): CutType {
   return {
     id: index + 1,
+    dbId: c.id,
     label: c.label,
     l: c.length,
     w: c.width,
@@ -74,6 +372,7 @@ function toAppCut(c: DBCut, index: number): CutType {
     qty: c.quantity,
     mat: c.material,
     group: c.groupName ?? undefined,
+    stepFileId: c.stepFileId ?? undefined,
     stepSessionId: c.stepSessionId ?? undefined,
     stepBodyIndex: c.stepBodyIndex ?? undefined,
     stepFaceIndex: c.stepFaceIndex ?? undefined,
@@ -164,7 +463,7 @@ function CutRow({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {/* Row 1: drag handle + checkbox + label + remove */}
+      {/* Row 1: drag handle + checkbox + label + delete */}
       <div className="flex items-center gap-2 px-2 pt-2 pb-0.5">
         <div
           draggable
@@ -218,9 +517,14 @@ function CutRow({
 
         <button
           onClick={onRemove}
-          title="Remove"
-          className="shrink-0 opacity-0 group-hover/row:opacity-100 transition-opacity text-slate-300 hover:text-red-500 text-base leading-none px-0.5"
-        >×</button>
+          title="Delete part"
+          className="shrink-0 inline-flex items-center gap-1 rounded border border-slate-200 px-1.5 py-1 text-xs font-medium text-slate-500 hover:border-red-200 hover:bg-red-50 hover:text-red-600 transition-colors"
+        >
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16" />
+          </svg>
+          <span>Delete</span>
+        </button>
       </div>
 
       {/* Row 2: dims · T · mat · qty + DXF + STEP badge */}
@@ -302,7 +606,7 @@ function CutRow({
         )}
 
         {/* DXF download */}
-        {cut.stepSessionId && (
+        {(cut.stepFileId || cut.stepSessionId) && (
           <button
             onClick={onDownloadDxf}
             className="shrink-0 opacity-0 group-hover/row:opacity-100 transition-opacity text-xs text-slate-400 hover:text-slate-700 px-1.5 py-0.5 border border-slate-200 rounded"
@@ -313,7 +617,7 @@ function CutRow({
         )}
 
         {/* STEP badge */}
-        {cut.stepSessionId && (
+        {(cut.stepFileId || cut.stepSessionId) && (
           <span title="From STEP import" className="shrink-0 text-xs text-slate-300 font-medium">3D</span>
         )}
 
@@ -345,7 +649,7 @@ function CutList({
   groupMultipliers: Record<string, number>;
   onMultiplierChange: (group: string, mult: number) => void;
 }) {
-  const dragIdRef = useRef<number | null>(null);
+  const [draggingCutId, setDraggingCutId] = useState<number | null>(null);
   const [dropTarget, setDropTarget] = useState<
     { kind: 'cut'; id: number } | { kind: 'group'; name: string } | null
   >(null);
@@ -387,7 +691,7 @@ function CutList({
   }, [cuts, onChange]);
 
   const handleDrop = useCallback((target: typeof dropTarget) => {
-    const srcId = dragIdRef.current;
+    const srcId = draggingCutId;
     if (srcId === null || target === null) { setDropTarget(null); return; }
 
     const next = cuts.map((c) => ({ ...c }));
@@ -414,9 +718,9 @@ function CutList({
       }
       onChange(next);
     }
-    dragIdRef.current = null;
+    setDraggingCutId(null);
     setDropTarget(null);
-  }, [cuts, onChange]);
+  }, [cuts, draggingCutId, onChange]);
 
   const renameGroup = useCallback((oldName: string, newName: string) => {
     const trimmed = newName.trim();
@@ -436,7 +740,7 @@ function CutList({
     return <p className="text-slate-500 text-xs text-center py-4">No parts added yet</p>;
   }
 
-  const isDragging = dragIdRef.current !== null;
+  const isDragging = draggingCutId !== null;
 
   return (
     <div className="space-y-2">
@@ -495,10 +799,10 @@ function CutList({
                   onChange={updateCut}
                   onRemove={() => onRemove(cut.id)}
                   onDownloadDxf={() => onDownloadDxf(cut)}
-                  onDragStart={() => { dragIdRef.current = cut.id; setDropTarget(null); }}
-                  onDragEnd={() => { dragIdRef.current = null; setDropTarget(null); }}
+                  onDragStart={() => { setDraggingCutId(cut.id); setDropTarget(null); }}
+                  onDragEnd={() => { setDraggingCutId(null); setDropTarget(null); }}
                   isDropTarget={dropTarget?.kind === 'cut' && dropTarget.id === cut.id}
-                  onDragOver={(e) => { e.preventDefault(); if (dragIdRef.current !== cut.id) setDropTarget({ kind: 'cut', id: cut.id }); }}
+                  onDragOver={(e) => { e.preventDefault(); if (draggingCutId !== cut.id) setDropTarget({ kind: 'cut', id: cut.id }); }}
                   onDragLeave={() => setDropTarget((prev) => prev?.kind === 'cut' && prev.id === cut.id ? null : prev)}
                   onDrop={() => handleDrop({ kind: 'cut', id: cut.id })}
                   selected={selected.has(cut.id)}
@@ -526,8 +830,8 @@ function CutList({
             onRemoveCut={(id) => onRemove(id)}
             onRemoveFromGroup={removeFromGroup}
             onDownloadDxf={onDownloadDxf}
-            onItemDragStart={(id) => { dragIdRef.current = id; setDropTarget(null); }}
-            onItemDragEnd={() => { dragIdRef.current = null; setDropTarget(null); }}
+            onItemDragStart={(id) => { setDraggingCutId(id); setDropTarget(null); }}
+            onItemDragEnd={() => { setDraggingCutId(null); setDropTarget(null); }}
             multiplier={groupMultipliers[name] ?? 1}
             onMultiplierChange={(m) => onMultiplierChange(name, m)}
           />
@@ -695,9 +999,13 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [project, setProject] = useState<Project | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [exportingBundle, setExportingBundle] = useState(false);
+  const [exportingSheetDxfs, setExportingSheetDxfs] = useState(false);
+  const [exportingVcarveDxfs, setExportingVcarveDxfs] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   const [stocks, setStocks] = useState<StockType[]>([]);
   const [cuts, setCuts] = useState<CutType[]>([]);
+  const [stepFiles, setStepFiles] = useState<DBStepFile[]>([]);
   const [kerf, setKerf] = useState(0.125);
   const [padding, setPadding] = useState(0.5);
   const [groupMultipliers, setGroupMultipliers] = useState<Record<string, number>>({});
@@ -706,31 +1014,17 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [result, setResult] = useState<OptimizationResult | null>(null);
   const [showLabels, setShowLabels] = useState(true);
   const [hoveredPart, setHoveredPart] = useState<{ sheetIndex: number; cutIndex: number } | null>(null);
-  const [gridSize, setGridSize] = useState(0.125); // 1/8" default snap
+  const [gridSize] = useState(0.125); // 1/8" default snap
   const [excludedKeys, setExcludedKeys] = useState<Set<PartInstanceKey>>(new Set());
+  const [initialLayoutOverrides, setInitialLayoutOverrides] = useState<ManualOverrides | undefined>(undefined);
+  const [shouldRestoreLayout, setShouldRestoreLayout] = useState(false);
 
-  const EXCLUDED_STORAGE_KEY = `layout-excluded-${id}`;
+  const AUTO_OPTIMIZE_STORAGE_KEY = `project-auto-optimize-${id}`;
   const stats = useMemo(() => result ? calculateStats(result) : null, [result]);
 
-  useEffect(() => {
-    if (!id) return;
-    try {
-      const raw = localStorage.getItem(EXCLUDED_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) setExcludedKeys(new Set(parsed as PartInstanceKey[]));
-    } catch { /* ignore */ }
-  }, [EXCLUDED_STORAGE_KEY, id]);
-
-  useEffect(() => {
-    if (!id) return;
-    try {
-      localStorage.setItem(EXCLUDED_STORAGE_KEY, JSON.stringify([...excludedKeys]));
-    } catch { /* ignore */ }
-  }, [EXCLUDED_STORAGE_KEY, id, excludedKeys]);
-
-  // Layout editor state (overrides, selection, undo/redo, localStorage)
+  // Layout editor state (overrides, selection, undo/redo)
   const {
+    hydrated: layoutEditorHydrated,
     overrides,
     selectedKeys,
     canUndo,
@@ -739,11 +1033,15 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     rotateSelected,
     pinSelected,
     unpinSelected,
-  } = useLayoutEditor(id, result);
+  } = useLayoutEditor(id, result, initialLayoutOverrides);
+
+  const layoutStateHydrated = !loading && layoutEditorHydrated;
 
   // Build a stable reference to result.sheets for keyboard callbacks
   const resultRef = useRef(result);
   useEffect(() => { resultRef.current = result; }, [result]);
+  const stepFilenameMap = useMemo(() => buildStepFilenameMap(stepFiles), [stepFiles]);
+  const stepSessionMap = useMemo(() => buildStepSessionMap(stepFiles), [stepFiles]);
 
   const expandedEffectiveCuts = useMemo(() => {
     const effectiveCuts = cuts.map(c => {
@@ -840,7 +1138,36 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
   useEffect(() => {
     fetchProject();
-  }, [id]);
+  }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (loading || result || stocks.length === 0 || cuts.length === 0 || !layoutStateHydrated) return;
+
+    let shouldAutoOptimize = shouldRestoreLayout;
+    try {
+      shouldAutoOptimize = shouldAutoOptimize || sessionStorage.getItem(AUTO_OPTIMIZE_STORAGE_KEY) === '1';
+      sessionStorage.removeItem(AUTO_OPTIMIZE_STORAGE_KEY);
+    } catch {
+      // Ignore browser storage failures.
+    }
+
+    if (!shouldAutoOptimize) return;
+    runOptimization(false);
+  }, [
+    AUTO_OPTIMIZE_STORAGE_KEY,
+    cuts.length,
+    layoutStateHydrated,
+    loading,
+    result,
+    runOptimization,
+    shouldRestoreLayout,
+    stocks.length,
+  ]);
+
+  useEffect(() => {
+    if (!result) return;
+    setShouldRestoreLayout(true);
+  }, [result]);
 
   // Auto-save 1.5 s after any change to the editable project data.
   // A ref guards against firing on the initial data load.
@@ -850,18 +1177,27 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     setIsDirty(true);
     const t = setTimeout(() => saveProject(), 1500);
     return () => clearTimeout(t);
-  }, [stocks, cuts, kerf, units, groupMultipliers]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cuts, excludedKeys, groupMultipliers, kerf, overrides, padding, result, stocks, units]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const fetchProject = async () => {
+  async function fetchProject() {
     try {
       const res = await fetch(`/api/v1/projects/${id}`);
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json() as Project;
         setProject(data);
         setStocks(data.stocks.map(toAppStock));
         setCuts(data.cuts.map(toAppCut));
+        setStepFiles(data.stepFiles ?? []);
         setKerf(data.kerf);
         setUnits((data.units as UnitSystem) ?? 'in');
+        setPadding(
+          typeof data.layoutPadding === 'number' && Number.isFinite(data.layoutPadding)
+            ? data.layoutPadding
+            : 0.5
+        );
+        setExcludedKeys(new Set((data.layoutExcludedKeys ?? []) as PartInstanceKey[]));
+        setInitialLayoutOverrides((data.layoutOverrides ?? {}) as ManualOverrides);
+        setShouldRestoreLayout(Boolean(data.layoutHasActive));
         try {
           const parsed = JSON.parse(data.groupMultipliers ?? '{}');
           if (parsed && typeof parsed === 'object') setGroupMultipliers(parsed);
@@ -875,7 +1211,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
       setLoading(false);
       isLoaded.current = true;
     }
-  };
+  }
 
   const saveProject = async () => {
     if (!project) return;
@@ -888,11 +1224,28 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           kerf,
           units,
           groupMultipliers,
-          stocks: stocks.map((s) => ({ name: s.name, l: s.l, w: s.w, t: s.t, qty: s.qty, mat: s.mat })),
+          layoutOverrides: overrides,
+          layoutExcludedKeys: [...excludedKeys],
+          layoutPadding: padding,
+          layoutHasActive: Boolean(result),
+          stepActiveFileId: project.stepActiveFileId ?? null,
+          stocks: stocks.map((s) => ({
+            id: s.dbId,
+            name: s.name,
+            l: s.l,
+            w: s.w,
+            t: s.t,
+            qty: s.qty,
+            mat: s.mat,
+          })),
           cuts: cuts.map((c) => ({
+            id: c.dbId,
             label: c.label, l: c.l, w: c.w, t: c.t, qty: c.qty, mat: c.mat,
-            group: c.group, stepSessionId: c.stepSessionId,
-            stepBodyIndex: c.stepBodyIndex, stepFaceIndex: c.stepFaceIndex,
+            group: c.group,
+            stepFileId: c.stepFileId,
+            stepSessionId: c.stepSessionId,
+            stepBodyIndex: c.stepBodyIndex,
+            stepFaceIndex: c.stepFaceIndex,
           })),
         }),
       });
@@ -907,7 +1260,9 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const addStock = (preset?: typeof STOCK_PRESETS[0]) => {
     const s = preset || { name: 'Custom', length: 96, width: 48 };
     setStocks([...stocks, {
-      id: Date.now(), name: s.name, l: s.length, w: s.width,
+      id: Date.now(),
+      dbId: crypto.randomUUID(),
+      name: s.name, l: s.length, w: s.width,
       t: (s as typeof STOCK_PRESETS[0]).thickness ?? 0, qty: 1, mat: 'Plywood',
     }]);
   };
@@ -915,66 +1270,122 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const removeStock = (stockId: number) => setStocks(stocks.filter((s) => s.id !== stockId));
   const removeCut = (cutId: number) => setCuts(cuts.filter((c) => c.id !== cutId));
 
-  const dim = (val: number) => {
+  const dim = useCallback((val: number) => {
     if (units === 'mm') return inToMM(val).toFixed(1);
     return toFraction(val);
-  };
+  }, [units]);
 
   const unitLabel = units === 'mm' ? 'mm' : 'in';
+  const toProjectMm = useCallback((val: number) => units === 'mm' ? val : inToMM(val), [units]);
 
-  const downloadSheetDxf = async (sheetIdx: number) => {
-    if (!result) return;
+  const csvCell = useCallback((value: string | number) => {
+    const text = String(value);
+    return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }, []);
+
+  const buildSheetContext = useCallback((sheetIdx: number) => {
+    if (!result) return null;
     const sheet = result.sheets[sheetIdx];
-    // Use merged sheet so manual overrides (drag, rotate, cross-sheet moves) are reflected
+    if (!sheet) return null;
+
     const mergedCuts = buildMergedSheet(sheet, sheetIdx, overrides, result.sheets);
-    const stepCuts = mergedCuts.filter(
-      (c) => c.stepSessionId && c.stepBodyIndex !== undefined && c.stepFaceIndex !== undefined
-    );
-    const dimCuts = mergedCuts.filter(
-      (c) => !c.stepSessionId
-    );
-    if (stepCuts.length === 0 && dimCuts.length === 0) return;
+    const numberedCuts: NumberedPlacedCut[] = [...mergedCuts]
+      .sort((a, b) => {
+        const areaDiff = (b.pw * b.ph) - (a.pw * a.ph);
+        return areaDiff !== 0 ? areaDiff : a.label.localeCompare(b.label);
+      })
+      .map((cut, index) => ({ ...cut, partNumber: index + 1 }));
 
-    // Determine unit conversion: optimizer works in the project's unit (in or mm)
-    const toMM = (v: number) => units === 'mm' ? v : inToMM(v);
+    const stepCuts = mergedCuts.flatMap((cut) => {
+      if (cut.stepBodyIndex === undefined || cut.stepFaceIndex === undefined) return [];
+      const sessionId = cut.stepFileId
+        ? stepSessionMap.get(cut.stepFileId) ?? null
+        : cut.stepSessionId ?? null;
+      if (!sessionId) return [];
+      return [{ cut, sessionId }] as const;
+    });
+    const dimCuts = mergedCuts.filter((c) => !c.stepFileId && !c.stepSessionId);
 
-    const sessionId = stepCuts[0]?.stepSessionId ?? '';
-    const sheetWmm = toMM(sheet.w);
-    const sheetLmm = toMM(sheet.l);
-
-    try {
-      const res = await fetch('/api/v1/step/export/sheet', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: sessionId,
-          sheet_width_mm: sheetWmm,
-          sheet_length_mm: sheetLmm,
+    const payload: SheetExportPayload | null =
+      stepCuts.length === 0 && dimCuts.length === 0
+        ? null
+        : {
+          session_id: stepCuts[0]?.sessionId ?? '',
+          sheet_width_mm: toProjectMm(sheet.w),
+          sheet_length_mm: toProjectMm(sheet.l),
           sheet_name: sheet.name,
-          placements: stepCuts.map((c) => ({
-            body_index: c.stepBodyIndex!,
-            face_index: c.stepFaceIndex!,
-            body_name: c.label,
-            x_mm: toMM(c.x),
-            y_mm: toMM(c.y),
-            rot: c.rot,
-            session_id: c.stepSessionId!,
+          placements: stepCuts.map(({ cut, sessionId }) => ({
+            body_index: cut.stepBodyIndex!,
+            face_index: cut.stepFaceIndex!,
+            body_name: cut.label,
+            x_mm: toProjectMm(cut.x),
+            y_mm: toProjectMm(cut.y),
+            rot: cut.rot,
+            session_id: sessionId,
           })),
           rect_placements: dimCuts.map((c) => ({
             body_name: c.label,
-            x_mm: toMM(c.x),
-            y_mm: toMM(c.y),
-            w_mm: toMM(c.pw),
-            h_mm: toMM(c.ph),
+            x_mm: toProjectMm(c.x),
+            y_mm: toProjectMm(c.y),
+            w_mm: toProjectMm(c.pw),
+            h_mm: toProjectMm(c.ph),
           })),
-        }),
-      });
-      if (!res.ok) return;
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
+        };
+
+    return { sheet, mergedCuts, numberedCuts, payload };
+  }, [overrides, result, stepSessionMap, toProjectMm]);
+
+  const fetchSheetPreviewData = useCallback(async (sheetIdx: number): Promise<SheetPreviewData | null> => {
+    const context = buildSheetContext(sheetIdx);
+    if (!context?.payload) return null;
+
+    const res = await fetch('/api/v1/step/export/sheet/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(context.payload),
+    });
+
+    if (!res.ok) return null;
+    return res.json();
+  }, [buildSheetContext]);
+
+  const exportableSheetIndices = useMemo(() => {
+    if (!result) return [];
+    return result.sheets.flatMap((_, index) => (buildSheetContext(index)?.payload ? [index] : []));
+  }, [buildSheetContext, result]);
+
+  const fetchSheetDxfExport = useCallback(async (
+    sheetIdx: number,
+    layerStyle: SheetLayerStyle = 'default'
+  ) => {
+    const context = buildSheetContext(sheetIdx);
+    if (!context?.payload) return null;
+    const { sheet, payload } = context;
+
+    const res = await fetch('/api/v1/step/export/sheet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, layer_style: layerStyle }),
+    });
+    if (!res.ok) {
+      const errorPayload = await res.json().catch(() => null) as { detail?: string } | null;
+      throw new Error(errorPayload?.detail ?? 'Sheet DXF export failed');
+    }
+
+    return {
+      blob: await res.blob(),
+      filename: buildSheetDxfFilename(sheetIdx, sheet.name, layerStyle),
+    };
+  }, [buildSheetContext]);
+
+  const downloadSheetDxf = async (sheetIdx: number, layerStyle: SheetLayerStyle = 'default') => {
+    try {
+      const exported = await fetchSheetDxfExport(sheetIdx, layerStyle);
+      if (!exported) return;
+      const url = URL.createObjectURL(exported.blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `Sheet_${sheetIdx + 1}_${sheet.name.replace(/[^a-zA-Z0-9]/g, '_')}.dxf`;
+      a.download = exported.filename;
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
@@ -982,53 +1393,65 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   };
 
+  const downloadAllSheetDxfs = async (layerStyle: SheetLayerStyle = 'default') => {
+    if (!project || exportableSheetIndices.length === 0) return;
+
+    const setExporting = layerStyle === 'vcarve' ? setExportingVcarveDxfs : setExportingSheetDxfs;
+    setExporting(true);
+    try {
+      const JSZip = (await import('jszip')).default;
+      const zip = new JSZip();
+      const exportErrors: string[] = [];
+      let exportedCount = 0;
+
+      if (layerStyle === 'vcarve') {
+        zip.file('README-vcarve.txt', buildVcarveReadme(project.name));
+      }
+
+      for (const sheetIdx of exportableSheetIndices) {
+        try {
+          const exported = await fetchSheetDxfExport(sheetIdx, layerStyle);
+          if (!exported) continue;
+          zip.file(exported.filename, exported.blob);
+          exportedCount += 1;
+        } catch (error) {
+          const fallbackSheetName = result?.sheets[sheetIdx]?.name ?? `Sheet ${sheetIdx + 1}`;
+          exportErrors.push(
+            `Sheet ${sheetIdx + 1} (${fallbackSheetName}): ${error instanceof Error ? error.message : 'Export failed'}`
+          );
+        }
+      }
+
+      if (exportErrors.length > 0) {
+        zip.file('export-errors.txt', exportErrors.join('\n'));
+      }
+      if (exportedCount === 0) {
+        throw new Error(exportErrors[0] ?? 'No sheet DXFs were available to export');
+      }
+
+      const bundleBlob = await zip.generateAsync({ type: 'blob' });
+      const bundleUrl = URL.createObjectURL(bundleBlob);
+      const a = document.createElement('a');
+      a.href = bundleUrl;
+      a.download = `${sanitizeFilenameSegment(project.name, 'project')}-${layerStyle === 'vcarve' ? 'vcarve-dxfs' : 'sheet-dxfs'}.zip`;
+      a.click();
+      URL.revokeObjectURL(bundleUrl);
+    } catch (error) {
+      console.error('All sheet DXF download failed:', error);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const [sheetPreview, setSheetPreview] = useState<SheetPreviewData | null>(null);
   const [sheetPreviewLoading, setSheetPreviewLoading] = useState(false);
 
   const previewSheetDxf = async (sheetIdx: number) => {
-    if (!result) return;
-    const sheet = result.sheets[sheetIdx];
-    const mergedCuts = buildMergedSheet(sheet, sheetIdx, overrides, result.sheets);
-    const stepCuts = mergedCuts.filter(
-      (c) => c.stepSessionId && c.stepBodyIndex !== undefined && c.stepFaceIndex !== undefined
-    );
-    const dimCuts = mergedCuts.filter((c) => !c.stepSessionId);
-    if (stepCuts.length === 0 && dimCuts.length === 0) return;
-
-    const toMM = (v: number) => units === 'mm' ? v : inToMM(v);
-    const sessionId = stepCuts[0]?.stepSessionId ?? '';
-
+    const context = buildSheetContext(sheetIdx);
+    if (!context?.payload) return;
     setSheetPreviewLoading(true);
     try {
-      const res = await fetch('/api/v1/step/export/sheet/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: sessionId,
-          sheet_width_mm: toMM(sheet.w),
-          sheet_length_mm: toMM(sheet.l),
-          sheet_name: sheet.name,
-          placements: stepCuts.map((c) => ({
-            body_index: c.stepBodyIndex!,
-            face_index: c.stepFaceIndex!,
-            body_name: c.label,
-            x_mm: toMM(c.x),
-            y_mm: toMM(c.y),
-            rot: c.rot,
-            session_id: c.stepSessionId!,
-          })),
-          rect_placements: dimCuts.map((c) => ({
-            body_name: c.label,
-            x_mm: toMM(c.x),
-            y_mm: toMM(c.y),
-            w_mm: toMM(c.pw),
-            h_mm: toMM(c.ph),
-          })),
-        }),
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      setSheetPreview(data);
+      setSheetPreview(await fetchSheetPreviewData(sheetIdx));
     } catch (e) {
       console.error('Sheet DXF preview failed:', e);
     } finally {
@@ -1037,13 +1460,16 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   };
 
   const downloadPartDxf = async (cut: CutType) => {
-    if (!cut.stepSessionId || cut.stepBodyIndex === undefined || cut.stepFaceIndex === undefined) return;
+    const sessionId = cut.stepFileId
+      ? stepSessionMap.get(cut.stepFileId) ?? null
+      : cut.stepSessionId ?? null;
+    if (!sessionId || cut.stepBodyIndex === undefined || cut.stepFaceIndex === undefined) return;
     try {
       const res = await fetch('/api/v1/step/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          session_id: cut.stepSessionId,
+          session_id: sessionId,
           body_index: cut.stepBodyIndex,
           body_name: cut.label,
           face_index: cut.stepFaceIndex,
@@ -1062,21 +1488,61 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   };
 
-  const downloadCutListCSV = () => {
-    if (!result) return;
-    const rows = [['Sheet', 'Part', 'Length', 'Width', 'X', 'Y', 'Rotated'].join(',')];
-    result.sheets.forEach((sheet, i) => {
-      sheet.cuts.forEach((c) => {
-        rows.push([`Sheet ${i + 1} (${sheet.name})`, c.label, c.ph, c.pw, c.x, c.y, c.rot ? 'Yes' : 'No'].join(','));
+  const buildCutListCsvContent = useCallback(() => {
+    if (!result) return null;
+
+    const rows = [[
+      'Sheet',
+      'Part #',
+      'Part',
+      `Length (${unitLabel})`,
+      `Width (${unitLabel})`,
+      `X (${unitLabel})`,
+      `Y (${unitLabel})`,
+      'Rotated',
+    ].map(csvCell).join(',')];
+
+    result.sheets.forEach((_sheet, i) => {
+      const context = buildSheetContext(i);
+      if (!context) return;
+      context.numberedCuts.forEach((c) => {
+        rows.push([
+          `Sheet ${i + 1} (${context.sheet.name})`,
+          c.partNumber,
+          c.label,
+          dim(Math.max(c.pw, c.ph)),
+          dim(Math.min(c.pw, c.ph)),
+          dim(c.x),
+          dim(c.y),
+          c.rot ? 'Yes' : 'No',
+        ].map(csvCell).join(','));
       });
     });
+
     if (result.unplaced.length > 0) {
-      rows.push('', 'UNPLACED PARTS');
+      rows.push('');
+      rows.push('UNPLACED PARTS');
       result.unplaced.forEach((c) => {
-        rows.push(['N/A', c.label, c.l, c.w, '', '', ''].join(','));
+        rows.push([
+          'N/A',
+          '',
+          c.label,
+          dim(Math.max(c.l, c.w)),
+          dim(Math.min(c.l, c.w)),
+          '',
+          '',
+          '',
+        ].map(csvCell).join(','));
       });
     }
-    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+
+    return rows.join('\n');
+  }, [buildSheetContext, csvCell, dim, result, unitLabel]);
+
+  const downloadCutListCSV = () => {
+    const csvContent = buildCutListCsvContent();
+    if (!csvContent) return;
+    const blob = new Blob([csvContent], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -1085,8 +1551,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     URL.revokeObjectURL(url);
   };
 
-  const downloadLayoutSVG = () => {
-    if (!result) return;
+  const buildLayoutSvgContent = useCallback(() => {
+    if (!result) return null;
     const padding = 50;
     const sheetGap = 40;
     const scale = 4;
@@ -1100,6 +1566,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
     let yOffset = padding;
     result.sheets.forEach((sheet, i) => {
+      const context = buildSheetContext(i);
+      if (!context) return;
       svgContent += `<text x="${padding}" y="${yOffset + 16}" fill="#334155" font-size="14" font-weight="500">Sheet ${i + 1}: ${sheet.name} (${sheet.w}" × ${sheet.l}")</text>`;
       yOffset += 24;
 
@@ -1116,7 +1584,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
       svgContent += `<rect x="${padding}" y="${yOffset}" width="${sheet.w * scale}" height="${sheet.l * scale}" fill="#e2e8f0" stroke="#94a3b8" stroke-width="2"/>`;
 
-      sheet.cuts.forEach((c, j) => {
+      context.numberedCuts.forEach((c, j) => {
         const col = CUT_COLORS[j % CUT_COLORS.length];
         const x = padding + c.x * scale;
         const y = yOffset + c.y * scale;
@@ -1131,6 +1599,12 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     });
 
     svgContent += '</svg>';
+    return svgContent;
+  }, [buildSheetContext, result]);
+
+  const downloadLayoutSVG = () => {
+    const svgContent = buildLayoutSvgContent();
+    if (!svgContent) return;
     const blob = new Blob([svgContent], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1140,145 +1614,494 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     URL.revokeObjectURL(url);
   };
 
-  const downloadPDF = () => {
-    if (!result) return;
+  const buildCutListPdf = useCallback(async () => {
+    if (!result) return null;
 
-    const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
+    const partOperationCache = new Map<string, Promise<PartOperationSummary | null>>();
+    const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'letter' });
     const pageWidth = pdf.internal.pageSize.getWidth();
     const pageHeight = pdf.internal.pageSize.getHeight();
-    const margin = 40;
-    const contentWidth = pageWidth - margin * 2;
-    let y = margin;
+    const margin = 36;
+    const previewBoxWidth = Math.min(380, pageWidth * 0.54);
+    const previewGap = 18;
+    const tableRightWidth = pageWidth - margin * 2 - previewBoxWidth - previewGap;
 
-    const largestDim = Math.max(...result.sheets.map((s) => Math.max(s.l, s.w)));
-    const globalScale = Math.min(contentWidth / largestDim, 3);
+    const previewEdgePoints = (edge: SheetPreviewData['edges'][number], sheetLengthMm: number) => {
+      if (edge.type === 'line') {
+        return [
+          { x: edge.start[0], y: sheetLengthMm - edge.start[1] },
+          { x: edge.end[0], y: sheetLengthMm - edge.end[1] },
+        ];
+      }
 
-    pdf.setFontSize(18);
-    pdf.setFont('helvetica', 'bold');
-    pdf.text(project?.name ?? 'Cut List', margin, y);
-    y += 10;
+      if (edge.type === 'polyline') {
+        return edge.points.map(([x, y]) => ({ x, y: sheetLengthMm - y }));
+      }
 
-    if (stats) {
-      pdf.setFontSize(10);
-      pdf.setFont('helvetica', 'normal');
-      pdf.setTextColor(100);
-      y += 15;
-      pdf.text(`${stats.sheets} sheet${stats.sheets !== 1 ? 's' : ''} · ${stats.waste}% waste${stats.unplaced > 0 ? ` · ${stats.unplaced} unplaced` : ''}`, margin, y);
-      pdf.setTextColor(0);
-    }
-    y += 30;
+      const sweep = edge.is_full_circle
+        ? 360
+        : (() => {
+          let delta = edge.end_angle - edge.start_angle;
+          if (delta <= 0) delta += 360;
+          return delta;
+        })();
 
-    result.sheets.forEach((sheet, i) => {
-      const diagramWidth = sheet.w * globalScale;
-      const diagramHeight = sheet.l * globalScale;
-      const sortedCuts = [...sheet.cuts].sort((a, b) => (b.pw * b.ph) - (a.pw * a.ph));
-      const tableHeight = 30 + sortedCuts.length * 14;
-      const sectionHeight = Math.max(diagramHeight + 25, tableHeight + 25);
+      const segments = edge.is_full_circle ? 40 : Math.max(12, Math.ceil(sweep / 15));
+      return Array.from({ length: segments + 1 }, (_, index) => {
+        const angle = edge.is_full_circle
+          ? (Math.PI * 2 * index) / segments
+          : ((edge.start_angle + (sweep * index) / segments) * Math.PI) / 180;
+        return {
+          x: edge.center[0] + edge.radius * Math.cos(angle),
+          y: sheetLengthMm - (edge.center[1] + edge.radius * Math.sin(angle)),
+        };
+      });
+    };
 
-      if (y + sectionHeight > pageHeight - margin) { pdf.addPage(); y = margin; }
+    const drawPolyline = (
+      points: Array<{ x: number; y: number }>,
+      originX: number,
+      originY: number,
+      scale: number,
+      strokeColor: [number, number, number]
+    ) => {
+      if (points.length < 2) return;
+      pdf.setDrawColor(...strokeColor);
+      for (let index = 1; index < points.length; index++) {
+        const from = points[index - 1];
+        const to = points[index];
+        pdf.line(
+          originX + from.x * scale,
+          originY + from.y * scale,
+          originX + to.x * scale,
+          originY + to.y * scale
+        );
+      }
+    };
 
-      pdf.setFontSize(12);
+    const getPartOperationSummary = (cut: NumberedPlacedCut): Promise<PartOperationSummary | null> => {
+      const sessionId = cut.stepFileId
+        ? stepSessionMap.get(cut.stepFileId) ?? null
+        : cut.stepSessionId ?? null;
+      if (!sessionId || cut.stepBodyIndex === undefined || cut.stepFaceIndex === undefined) {
+        return Promise.resolve(null);
+      }
+
+      const cacheKey = `${sessionId}:${cut.stepBodyIndex}:${cut.stepFaceIndex}`;
+      const cached = partOperationCache.get(cacheKey);
+      if (cached) return cached;
+
+      const request = fetch(`/api/v1/step/${sessionId}/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          body_index: cut.stepBodyIndex,
+          face_index: cut.stepFaceIndex,
+        }),
+      })
+        .then(async (res) => {
+          if (!res.ok) return null;
+          const data = await res.json() as PartPreviewData;
+          return summarizeOperationLayers(data.edges ?? [], data.face_dims_mm?.[2] ?? null);
+        })
+        .catch(() => null);
+
+      partOperationCache.set(cacheKey, request);
+      return request;
+    };
+
+    const renderSheetTable = (
+      cuts: NumberedPlacedCut[],
+      startIndex: number,
+      x: number,
+      y: number,
+      width: number,
+      bottom: number,
+      operationSummaries: Map<string, PartOperationSummary | null> = new Map()
+    ) => {
+      const colNumber = 28;
+      const colSize = 74;
+      const colThickness = 40;
+      const partColWidth = Math.max(96, width - colNumber - colSize - colThickness - 16);
+      let cursorY = y;
+      let index = startIndex;
+
+      pdf.setFillColor(248, 250, 252);
+      pdf.setDrawColor(226, 232, 240);
+      pdf.roundedRect(x, cursorY, width, 18, 4, 4, 'FD');
       pdf.setFont('helvetica', 'bold');
-      pdf.setTextColor(0);
-      pdf.text(`Sheet ${i + 1}: ${sheet.name} (${sheet.w}" × ${sheet.l}")`, margin, y);
-      y += 18;
+      pdf.setFontSize(8);
+      pdf.setTextColor(100);
+      pdf.text('#', x + 6, cursorY + 12);
+      pdf.text('Part', x + colNumber + 6, cursorY + 12);
+      pdf.text(`L × W (${unitLabel})`, x + colNumber + partColWidth + 6, cursorY + 12);
+      pdf.text(`T (${unitLabel})`, x + colNumber + partColWidth + colSize + 6, cursorY + 12);
+      cursorY += 18;
 
-      const sectionStartY = y;
+      pdf.setFont('helvetica', 'normal');
+      pdf.setTextColor(55, 65, 81);
+
+      while (index < cuts.length) {
+        const cut = cuts[index];
+        const sizeText = `${dim(Math.max(cut.pw, cut.ph))} × ${dim(Math.min(cut.pw, cut.ph))}`;
+        const operationSummary = operationSummaries.get(cut.instanceKey) ?? null;
+        const thicknessText = getPartThicknessDisplay(cut, operationSummary, units);
+        const exportLabel = buildExportPartLabel(cut, stepFilenameMap);
+        const labelLines = pdf.splitTextToSize(exportLabel, partColWidth - 8) as string[];
+        const operationLines = buildOperationLines(
+          cut,
+          operationSummary,
+          units
+        ).flatMap((line) => pdf.splitTextToSize(line, partColWidth - 8) as string[]);
+        const rowHeight = Math.max(
+          18,
+          labelLines.length * 8 + (operationLines.length > 0 ? operationLines.length * 7 + 8 : 6)
+        );
+
+        if (cursorY + rowHeight > bottom) break;
+
+        pdf.setDrawColor(241, 245, 249);
+        pdf.line(x, cursorY, x + width, cursorY);
+        pdf.text(String(cut.partNumber), x + 6, cursorY + 11);
+        pdf.text(labelLines, x + colNumber + 6, cursorY + 11);
+        if (operationLines.length > 0) {
+          pdf.setFontSize(6.5);
+          pdf.setTextColor(100);
+          pdf.text(operationLines, x + colNumber + 6, cursorY + 11 + labelLines.length * 8);
+          pdf.setFontSize(8);
+          pdf.setTextColor(55, 65, 81);
+        }
+        pdf.text(sizeText, x + colNumber + partColWidth + 6, cursorY + 11);
+        pdf.text(thicknessText, x + colNumber + partColWidth + colSize + 6, cursorY + 11);
+        cursorY += rowHeight;
+        index++;
+      }
+
+      return index;
+    };
+
+    for (let sheetIdx = 0; sheetIdx < result.sheets.length; sheetIdx++) {
+      if (sheetIdx > 0) {
+        pdf.addPage('letter', 'landscape');
+      }
+
+      const context = buildSheetContext(sheetIdx);
+      if (!context) continue;
+
+      const { sheet, numberedCuts } = context;
+      let previewData: SheetPreviewData | null = null;
+      try {
+        previewData = await fetchSheetPreviewData(sheetIdx);
+      } catch {
+        previewData = null;
+      }
+      const operationSummaries = new Map(
+        await Promise.all(
+          numberedCuts.map(async (cut) => [cut.instanceKey, await getPartOperationSummary(cut)] as const)
+        )
+      );
+      const sheetOperationSummary = mergeOperationSummaries([...operationSummaries.values()]);
+
+      const headerY = margin;
+      const headerRightX = pageWidth - margin;
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(17);
+      pdf.setTextColor(15, 23, 42);
+      pdf.text(project?.name ?? 'Cut List', margin, headerY);
+
+      pdf.setFontSize(11);
+      pdf.text(`Sheet ${sheetIdx + 1}: ${sheet.name}`, margin, headerY + 18);
+
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(9);
+      pdf.setTextColor(100);
+      pdf.text(`${dim(sheet.w)} × ${dim(sheet.l)} ${unitLabel}`, margin, headerY + 32);
+      pdf.text(`Numbers match table · black profile · red holes · blue pockets`, margin, headerY + 44);
+
+      if (stats) {
+        pdf.text(
+          `${stats.sheets} sheet${stats.sheets !== 1 ? 's' : ''} · ${stats.waste}% waste${stats.unplaced > 0 ? ` · ${stats.unplaced} unplaced` : ''}`,
+          headerRightX,
+          headerY + 18,
+          { align: 'right' }
+        );
+      }
+      pdf.text(buildSheetOperationText(sheetOperationSummary, units), headerRightX, headerY + 32, { align: 'right' });
+
+      const previewBoxY = headerY + 56;
+      const previewBoxHeight = pageHeight - previewBoxY - margin;
+      const tableX = margin + previewBoxWidth + previewGap;
+      const tableTop = previewBoxY;
+      const tableBottom = pageHeight - margin;
+
+      pdf.setDrawColor(226, 232, 240);
+      pdf.roundedRect(margin, previewBoxY, previewBoxWidth, previewBoxHeight, 6, 6, 'S');
+
+      const sheetWidthMm = previewData?.sheet_width_mm ?? toProjectMm(sheet.w);
+      const sheetLengthMm = previewData?.sheet_length_mm ?? toProjectMm(sheet.l);
+      const innerPadding = 14;
+      const previewScale = Math.min(
+        (previewBoxWidth - innerPadding * 2) / sheetWidthMm,
+        (previewBoxHeight - innerPadding * 2) / sheetLengthMm
+      );
+      const drawingWidth = sheetWidthMm * previewScale;
+      const drawingHeight = sheetLengthMm * previewScale;
+      const drawingX = margin + (previewBoxWidth - drawingWidth) / 2;
+      const drawingY = previewBoxY + (previewBoxHeight - drawingHeight) / 2;
 
       pdf.setDrawColor(148, 163, 184);
-      pdf.setFillColor(241, 245, 249);
-      pdf.rect(margin, y, diagramWidth, diagramHeight, 'FD');
+      pdf.setLineWidth(1);
+      pdf.rect(drawingX, drawingY, drawingWidth, drawingHeight, 'S');
 
-      sheet.cuts.forEach((c, j) => {
-        const col = CUT_COLORS[j % CUT_COLORS.length];
-        const r = parseInt(col.slice(1, 3), 16);
-        const g = parseInt(col.slice(3, 5), 16);
-        const b = parseInt(col.slice(5, 7), 16);
-        pdf.setFillColor(r, g, b);
-        pdf.setDrawColor(r, g, b);
-        const cx = margin + c.x * globalScale;
-        const cy = y + c.y * globalScale;
-        const cw = c.pw * globalScale;
-        const ch = c.ph * globalScale;
-        pdf.rect(cx, cy, cw, ch, 'FD');
-        const fontSize = Math.min(cw / 4, ch / 4, 9);
-        if (fontSize >= 5) {
-          pdf.setFontSize(fontSize);
-          pdf.setFont('helvetica', 'bold');
-          pdf.setTextColor(255);
-          const labelWidth = pdf.getTextWidth(c.label);
-          if (labelWidth < cw - 2 && fontSize < ch - 2) {
-            pdf.text(c.label, cx + cw / 2 - labelWidth / 2, cy + ch / 2 + fontSize / 3);
-          }
-          pdf.setTextColor(0);
-        }
+      if (previewData?.edges?.length) {
+        [...previewData.edges]
+          .sort((a, b) => getPdfLayerDrawPriority(a.layer) - getPdfLayerDrawPriority(b.layer))
+          .forEach((edge) => {
+          pdf.setLineWidth(getPdfLayerLineWidth(edge.layer));
+          drawPolyline(
+            previewEdgePoints(edge, sheetLengthMm),
+            drawingX,
+            drawingY,
+            previewScale,
+            getPdfLayerColor(edge.layer)
+          );
+          });
+      } else {
+        pdf.setDrawColor(15, 23, 42);
+        pdf.setLineWidth(0.7);
+        numberedCuts.forEach((cut) => {
+          pdf.rect(
+            drawingX + toProjectMm(cut.x) * previewScale,
+            drawingY + toProjectMm(cut.y) * previewScale,
+            toProjectMm(cut.pw) * previewScale,
+            toProjectMm(cut.ph) * previewScale,
+            'S'
+          );
+        });
+      }
+
+      numberedCuts.forEach((cut) => {
+        const centerX = drawingX + toProjectMm(cut.x + cut.pw / 2) * previewScale;
+        const centerY = drawingY + (sheetLengthMm - toProjectMm(cut.y + cut.ph / 2)) * previewScale;
+        const badgeRadius = Math.max(
+          7,
+          Math.min(12, Math.min(toProjectMm(cut.pw) * previewScale, toProjectMm(cut.ph) * previewScale) * 0.28)
+        );
+        pdf.setFillColor(255, 255, 255);
+        pdf.setDrawColor(15, 23, 42);
+        pdf.circle(centerX, centerY, badgeRadius, 'FD');
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(Math.max(7, badgeRadius));
+        pdf.setTextColor(15, 23, 42);
+        pdf.text(String(cut.partNumber), centerX, centerY + badgeRadius * 0.35, { align: 'center' });
       });
 
-      const tableX = diagramWidth < contentWidth * 0.55 ? margin + diagramWidth + 15 : margin;
-      const tableStartY = diagramWidth < contentWidth * 0.55 ? sectionStartY : sectionStartY + diagramHeight + 15;
-      const tableWidth = diagramWidth < contentWidth * 0.55 ? contentWidth - diagramWidth - 15 : contentWidth;
-      let tableY = tableStartY;
-
-      pdf.setFontSize(8);
-      pdf.setFont('helvetica', 'bold');
-      pdf.setFillColor(248, 250, 252);
-      pdf.rect(tableX, tableY, tableWidth, 14, 'F');
-      pdf.setTextColor(100);
-      pdf.text('#', tableX + 4, tableY + 10);
-      pdf.text('Part', tableX + 20, tableY + 10);
-      pdf.text('L', tableX + tableWidth - 50, tableY + 10);
-      pdf.text('W', tableX + tableWidth - 25, tableY + 10);
-      tableY += 14;
-
-      pdf.setFont('helvetica', 'normal');
-      pdf.setTextColor(60);
-      sortedCuts.forEach((c, idx) => {
-        const l = Math.max(c.pw, c.ph);
-        const w = Math.min(c.pw, c.ph);
-        pdf.setDrawColor(230);
-        pdf.line(tableX, tableY, tableX + tableWidth, tableY);
-        pdf.text(`${idx + 1}`, tableX + 4, tableY + 10);
-        pdf.text(c.label, tableX + 20, tableY + 10);
-        pdf.text(`${l}"`, tableX + tableWidth - 50, tableY + 10);
-        pdf.text(`${w}"`, tableX + tableWidth - 25, tableY + 10);
-        tableY += 14;
-      });
-
-      y = Math.max(sectionStartY + diagramHeight, tableY) + 25;
-    });
-
-    if (result.unplaced.length > 0) {
-      if (y > pageHeight - 80) { pdf.addPage(); y = margin; }
-      pdf.setFontSize(11);
-      pdf.setFont('helvetica', 'bold');
-      pdf.setTextColor(180, 0, 0);
-      pdf.text(`Unplaced Parts (${result.unplaced.length})`, margin, y);
-      y += 18;
-      pdf.setFontSize(8);
-      pdf.setFont('helvetica', 'bold');
-      pdf.setFillColor(254, 242, 242);
-      pdf.rect(margin, y, 200, 14, 'F');
-      pdf.setTextColor(100);
-      pdf.text('Part', margin + 4, y + 10);
-      pdf.text('L', margin + 140, y + 10);
-      pdf.text('W', margin + 170, y + 10);
-      y += 14;
-      pdf.setFont('helvetica', 'normal');
-      result.unplaced.forEach((p) => {
-        const l = Math.max(p.l, p.w);
-        const w = Math.min(p.l, p.w);
-        pdf.setDrawColor(230);
-        pdf.line(margin, y, margin + 200, y);
-        pdf.setTextColor(180, 0, 0);
-        pdf.text(p.label, margin + 4, y + 10);
+      let nextRow = renderSheetTable(numberedCuts, 0, tableX, tableTop, tableRightWidth, tableBottom, operationSummaries);
+      while (nextRow < numberedCuts.length) {
+        pdf.addPage('letter', 'landscape');
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(12);
+        pdf.setTextColor(15, 23, 42);
+        pdf.text(`Sheet ${sheetIdx + 1}: ${sheet.name} (continued)`, margin, margin);
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(9);
         pdf.setTextColor(100);
-        pdf.text(`${l}"`, margin + 140, y + 10);
-        pdf.text(`${w}"`, margin + 170, y + 10);
-        y += 14;
-      });
+        pdf.text(`Units: ${unitLabel}`, pageWidth - margin, margin, { align: 'right' });
+        nextRow = renderSheetTable(
+          numberedCuts,
+          nextRow,
+          margin,
+          margin + 16,
+          pageWidth - margin * 2,
+          pageHeight - margin,
+          operationSummaries
+        );
+      }
     }
 
+    if (result.unplaced.length > 0) {
+      pdf.addPage('letter', 'landscape');
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(16);
+      pdf.setTextColor(180, 0, 0);
+      pdf.text(`Unplaced Parts (${result.unplaced.length})`, margin, margin);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(9);
+      pdf.setTextColor(100);
+      pdf.text(`Units: ${unitLabel}`, pageWidth - margin, margin, { align: 'right' });
+
+      const tableCuts = result.unplaced
+        .slice()
+        .sort((a, b) => (b.l * b.w) - (a.l * a.w))
+        .map((cut, index) => ({
+          ...cut,
+          x: 0,
+          y: 0,
+          pw: cut.w,
+          ph: cut.l,
+          rot: false,
+          instanceKey: `${cut.id}-${index}`,
+          partNumber: index + 1,
+        })) as NumberedPlacedCut[];
+
+      renderSheetTable(tableCuts, 0, margin, margin + 20, pageWidth - margin * 2, pageHeight - margin);
+    }
+
+    return pdf;
+  }, [buildSheetContext, dim, fetchSheetPreviewData, project?.name, result, stats, stepFilenameMap, stepSessionMap, toProjectMm, unitLabel, units]);
+
+  const downloadPDF = async () => {
+    const pdf = await buildCutListPdf();
+    if (!pdf) return;
     pdf.save(`${project?.name ?? 'cut-list'}.pdf`);
+  };
+
+  const downloadProjectBundle = async () => {
+    if (!project) return;
+
+    setExportingBundle(true);
+    try {
+      const JSZip = (await import('jszip')).default;
+      const zip = new JSZip();
+      const safeProjectName = sanitizeFilenameSegment(project.name, 'project');
+      const exportedStepFiles = [];
+
+      for (const [index, stepFile] of stepFiles.entries()) {
+        const safeStem = sanitizeFilenameSegment(
+          stepFile.filename.replace(/\.(step|stp)$/i, ''),
+          `step-file-${index + 1}`
+        );
+        const extension = stepFile.filename.match(/\.stp$/i) ? '.stp' : '.step';
+        const fileName = `${safeStem}${extension}`;
+
+        try {
+          const res = await fetch(`/api/v1/projects/${id}/step-files/${stepFile.id}/file`);
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          zip.file(`step-files/${fileName}`, await res.blob());
+          exportedStepFiles.push({
+            id: stepFile.id,
+            fileName,
+            filename: stepFile.filename,
+            sortOrder: stepFile.sortOrder,
+            selectedBodyIndex: stepFile.selectedBodyIndex,
+            bodyState: stepFile.bodyState,
+            exported: true,
+          });
+        } catch (error) {
+          exportedStepFiles.push({
+            id: stepFile.id,
+            fileName,
+            filename: stepFile.filename,
+            sortOrder: stepFile.sortOrder,
+            selectedBodyIndex: stepFile.selectedBodyIndex,
+            bodyState: stepFile.bodyState,
+            exported: false,
+            error: error instanceof Error ? error.message : 'Failed to export STEP file',
+          });
+        }
+      }
+
+      const csvContent = buildCutListCsvContent();
+      if (csvContent) {
+        zip.file('exports/cut-list.csv', csvContent);
+      }
+
+      const svgContent = buildLayoutSvgContent();
+      if (svgContent) {
+        zip.file('exports/cut-layout.svg', svgContent);
+      }
+
+      const pdf = await buildCutListPdf();
+      if (pdf) {
+        zip.file('exports/cut-list.pdf', pdf.output('blob'));
+      }
+
+      const missingStepFiles = exportedStepFiles.filter((stepFile) => !stepFile.exported);
+      if (missingStepFiles.length > 0) {
+        zip.file(
+          'exports/missing-step-files.txt',
+          missingStepFiles
+            .map((stepFile) => `${stepFile.id}: ${stepFile.fileName} — ${stepFile.error ?? 'Missing'}`)
+            .join('\n')
+        );
+      }
+
+      zip.file('project.json', JSON.stringify({
+        format: 'kerfuffle-project-bundle',
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        sourceProjectId: project.id,
+        project: {
+          name: project.name,
+          description: project.description,
+          settings: {
+            kerf,
+            padding,
+            units,
+            groupMultipliers,
+          },
+          layout: {
+            overrides,
+            excludedKeys: [...excludedKeys],
+          },
+          stepActiveFileId: project.stepActiveFileId ?? null,
+          stepFiles: exportedStepFiles.map((stepFile) => ({
+            id: stepFile.id,
+            fileName: stepFile.fileName,
+            filename: stepFile.filename,
+            sortOrder: stepFile.sortOrder,
+            selectedBodyIndex: stepFile.selectedBodyIndex,
+            bodyState: stepFile.bodyState,
+            exported: stepFile.exported,
+            error: stepFile.exported ? undefined : stepFile.error,
+          })),
+          stocks,
+          cuts,
+          optimization: result
+            ? {
+              stats,
+              sheets: result.sheets.map((_sheet, index) => {
+                const context = buildSheetContext(index);
+                return context ? {
+                  sheetIndex: index,
+                  name: context.sheet.name,
+                  width: context.sheet.w,
+                  length: context.sheet.l,
+                  cuts: context.numberedCuts.map((cut) => ({
+                    partNumber: cut.partNumber,
+                    label: cut.label,
+                    x: cut.x,
+                    y: cut.y,
+                    width: cut.pw,
+                    height: cut.ph,
+                    rotated: cut.rot,
+                    stepFileId: cut.stepFileId ?? null,
+                    stepSessionId: cut.stepSessionId ?? null,
+                    stepBodyIndex: cut.stepBodyIndex ?? null,
+                    stepFaceIndex: cut.stepFaceIndex ?? null,
+                  })),
+                } : null;
+              }).filter(Boolean),
+              unplaced: result.unplaced,
+            }
+            : null,
+        },
+      }, null, 2));
+
+      const bundleBlob = await zip.generateAsync({ type: 'blob' });
+      const bundleUrl = URL.createObjectURL(bundleBlob);
+      const a = document.createElement('a');
+      a.href = bundleUrl;
+      a.download = `${safeProjectName}-bundle.zip`;
+      a.click();
+      URL.revokeObjectURL(bundleUrl);
+    } catch (error) {
+      console.error('Project bundle export failed:', error);
+    } finally {
+      setExportingBundle(false);
+    }
   };
 
   if (loading) {
@@ -1317,6 +2140,13 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <UnitToggle value={units} onChange={setUnits} />
+              <button
+                onClick={downloadProjectBundle}
+                disabled={exportingBundle}
+                className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-50 text-slate-600 transition-colors text-xs font-medium disabled:opacity-50"
+              >
+                {exportingBundle ? 'Exporting…' : 'Export Bundle'}
+              </button>
               <button
                 onClick={saveProject}
                 disabled={saving}
@@ -1481,7 +2311,19 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           <div className="flex justify-between items-center">
             <h2 className="text-slate-500 text-xs font-medium uppercase tracking-wide">Parts to Cut</h2>
             <button
-              onClick={() => setCuts([...cuts, { id: Date.now(), label: `Part ${cuts.length + 1}`, l: 24, w: 12, t: 0, qty: 1, mat: '' }])}
+              onClick={() => setCuts([
+                ...cuts,
+                {
+                  id: Date.now(),
+                  dbId: crypto.randomUUID(),
+                  label: `Part ${cuts.length + 1}`,
+                  l: 24,
+                  w: 12,
+                  t: 0,
+                  qty: 1,
+                  mat: '',
+                },
+              ])}
               className="text-xs text-slate-500 hover:text-slate-700"
             >
               +add
@@ -1525,12 +2367,12 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             </div>
             <div className="space-y-2">
               {result.sheets.map((sheet, i) => {
-                const hasStepCuts = sheet.cuts.some((c) => c.stepSessionId);
+                const canExportSheet = Boolean(buildSheetContext(i)?.payload);
                 return (
                   <div key={i}>
                     <div className="flex items-center justify-between text-xs text-slate-500 mb-0.5">
                       <span>Sheet {i + 1}: {sheet.name}</span>
-                      {hasStepCuts && (
+                      {canExportSheet && (
                         <div className="flex gap-1">
                           <button
                             onClick={() => previewSheetDxf(i)}
@@ -1541,9 +2383,17 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
                           </button>
                           <button
                             onClick={() => downloadSheetDxf(i)}
-                            className="text-xs px-1.5 py-0.5 border border-slate-200 rounded hover:bg-slate-50 text-slate-500"
+                            disabled={exportingSheetDxfs}
+                            className="text-xs px-1.5 py-0.5 border border-slate-200 rounded hover:bg-slate-50 text-slate-500 disabled:opacity-40"
                           >
                             ↓ DXF
+                          </button>
+                          <button
+                            onClick={() => downloadSheetDxf(i, 'vcarve')}
+                            disabled={exportingVcarveDxfs}
+                            className="text-xs px-1.5 py-0.5 border border-amber-200 rounded hover:bg-amber-50 text-amber-700 disabled:opacity-40"
+                          >
+                            ↓ VCarve
                           </button>
                         </div>
                       )}
@@ -1614,6 +2464,20 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
               <button onClick={downloadPDF} className="text-slate-600 hover:text-slate-800 text-xs">↓ PDF</button>
               <button onClick={downloadCutListCSV} className="text-slate-400 hover:text-slate-600 text-xs">↓ CSV</button>
               <button onClick={downloadLayoutSVG} className="text-slate-400 hover:text-slate-600 text-xs">↓ SVG</button>
+              <button
+                onClick={() => downloadAllSheetDxfs()}
+                disabled={exportingSheetDxfs || exportableSheetIndices.length === 0}
+                className="text-slate-400 hover:text-slate-600 text-xs disabled:opacity-40"
+              >
+                {exportingSheetDxfs ? 'Preparing DXFs…' : '↓ All Sheet DXFs'}
+              </button>
+              <button
+                onClick={() => downloadAllSheetDxfs('vcarve')}
+                disabled={exportingVcarveDxfs || exportableSheetIndices.length === 0}
+                className="text-amber-700 hover:text-amber-800 text-xs disabled:opacity-40"
+              >
+                {exportingVcarveDxfs ? 'Preparing VCarve DXFs…' : '↓ VCarve DXFs'}
+              </button>
             </div>
           </div>
         )}

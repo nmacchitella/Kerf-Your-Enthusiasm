@@ -40,6 +40,20 @@ function layerColor(layer?: string): string {
   return '#94a3b8';
 }
 
+function layerStrokeWidth(layer?: string): string {
+  if (!layer || layer === 'PROFILE') return '0.65';
+  if (layer === 'HOLES') return '0.65';
+  if (layer.startsWith('DEPTH_')) return '0.5';
+  return '0.5';
+}
+
+function layerDrawPriority(layer?: string): number {
+  if (!layer || layer === 'PROFILE') return 2;
+  if (layer === 'HOLES') return 3;
+  if (layer.startsWith('DEPTH_')) return 1;
+  return 0;
+}
+
 export function SvgPreview({ edgeData }: { edgeData: EdgeData }) {
   const { viewBox, paths } = useMemo(() => {
     const { edges } = edgeData;
@@ -63,29 +77,32 @@ export function SvgPreview({ edgeData }: { edgeData: EdgeData }) {
     const vbX = minX - pad, vbY = minY - pad;
     const vbW = maxX - minX + pad * 2, vbH = maxY - minY + pad * 2;
     const flip = (y: number) => vbY + vbH - (y - vbY);
-    const result: { d: string; color: string; key: number }[] = [];
+    const result: { d: string; color: string; strokeWidth: string; key: number; priority: number }[] = [];
 
     for (let i = 0; i < edges.length; i++) {
       const e = edges[i];
       const color = layerColor(e.layer);
+      const strokeWidth = layerStrokeWidth(e.layer);
+      const priority = layerDrawPriority(e.layer);
       if (e.type === 'line') {
-        result.push({ d: `M ${e.start[0]} ${flip(e.start[1])} L ${e.end[0]} ${flip(e.end[1])}`, color, key: i });
+        result.push({ d: `M ${e.start[0]} ${flip(e.start[1])} L ${e.end[0]} ${flip(e.end[1])}`, color, strokeWidth, key: i, priority });
       } else if (e.type === 'arc') {
         if (e.is_full_circle) {
-          result.push({ d: `M ${e.center[0] - e.radius} ${flip(e.center[1])} A ${e.radius} ${e.radius} 0 1 0 ${e.center[0] + e.radius} ${flip(e.center[1])} A ${e.radius} ${e.radius} 0 1 0 ${e.center[0] - e.radius} ${flip(e.center[1])}`, color, key: i });
+          result.push({ d: `M ${e.center[0] - e.radius} ${flip(e.center[1])} A ${e.radius} ${e.radius} 0 1 0 ${e.center[0] + e.radius} ${flip(e.center[1])} A ${e.radius} ${e.radius} 0 1 0 ${e.center[0] - e.radius} ${flip(e.center[1])}`, color, strokeWidth, key: i, priority });
         } else {
           const cx = e.center[0], cy = flip(e.center[1]), r = e.radius;
           const startRad = (e.start_angle * Math.PI) / 180, endRad = (e.end_angle * Math.PI) / 180;
           const sx = cx + r * Math.cos(startRad), sy = cy - r * Math.sin(startRad);
           const ex = cx + r * Math.cos(endRad), ey = cy - r * Math.sin(endRad);
           let sweep = e.end_angle - e.start_angle; if (sweep <= 0) sweep += 360;
-          result.push({ d: `M ${sx} ${sy} A ${r} ${r} 0 ${sweep > 180 ? 1 : 0} 0 ${ex} ${ey}`, color, key: i });
+          result.push({ d: `M ${sx} ${sy} A ${r} ${r} 0 ${sweep > 180 ? 1 : 0} 0 ${ex} ${ey}`, color, strokeWidth, key: i, priority });
         }
       } else if (e.type === 'polyline') {
         const pts = e.points; if (pts.length < 2) continue;
-        result.push({ d: pts.map(([x, y], idx) => `${idx === 0 ? 'M' : 'L'} ${x} ${flip(y)}`).join(' '), color, key: i });
+        result.push({ d: pts.map(([x, y], idx) => `${idx === 0 ? 'M' : 'L'} ${x} ${flip(y)}`).join(' '), color, strokeWidth, key: i, priority });
       }
     }
+    result.sort((a, b) => a.priority - b.priority || a.key - b.key);
     return { viewBox: `${vbX} ${vbY} ${vbW} ${vbH}`, paths: result };
   }, [edgeData]);
 
@@ -148,8 +165,8 @@ export function SvgPreview({ edgeData }: { edgeData: EdgeData }) {
           preserveAspectRatio="xMidYMid meet"
           style={{ background: 'transparent' }}
         >
-          {paths.map(({ d, color, key }) => (
-            <path key={key} d={d} stroke={color} strokeWidth="0.5" fill="none" vectorEffect="non-scaling-stroke" />
+          {paths.map(({ d, color, strokeWidth, key }) => (
+            <path key={key} d={d} stroke={color} strokeWidth={strokeWidth} fill="none" vectorEffect="non-scaling-stroke" />
           ))}
         </svg>
       </div>

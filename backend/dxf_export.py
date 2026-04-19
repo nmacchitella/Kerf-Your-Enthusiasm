@@ -11,11 +11,20 @@ import ezdxf
 from ezdxf import appsettings, zoom
 from ezdxf.math import Vec2
 
+from vcarve_layers import map_layer_name, normalize_layer_style
 
-def edges_to_dxf(edge_data: dict, output_path: str, body_name: str) -> None:
+
+def edges_to_dxf(
+    edge_data: dict,
+    output_path: str,
+    body_name: str,
+    *,
+    layer_style: str = "default",
+) -> None:
     """
     Write a DXF file from the projection result, normalized to origin (0, 0).
     """
+    layer_style = normalize_layer_style(layer_style)
     edges = edge_data["edges"]
     if not edges:
         raise ValueError("No edges to export — face may have no wire boundary")
@@ -29,9 +38,8 @@ def edges_to_dxf(edge_data: dict, output_path: str, body_name: str) -> None:
     doc.header["$MEASUREMENT"] = 1   # metric
 
     msp = doc.modelspace()
-    # Everything goes on layer "0" so all DXF viewers show it.
-    # Outer profile uses color 7 (white/black); inner holes use color 1 (red)
-    # so they're visually distinct and VCarve Pro can select by color.
+    # Keep semantic layers in the output so downstream CAM tools can target
+    # profiles, holes, and depth features independently.
 
     # ── Normalization helper ───────────────────────────────────────────
     def norm(pt: list[float]) -> Vec2:
@@ -45,7 +53,7 @@ def edges_to_dxf(edge_data: dict, output_path: str, body_name: str) -> None:
         # PROFILE = outer boundary (color 7, white/black)
         # HOLES   = coplanar cutouts (color 1, red)
         # DEPTH_X.XXXmm = features at depth X (color 5, blue)
-        layer = edge_layer
+        layer = map_layer_name(edge_layer, layer_style=layer_style)
         if edge_layer == "HOLES":
             color = 1
         elif edge_layer.startswith("DEPTH_"):
@@ -171,27 +179,34 @@ def export_body_face(
     face_index: int,
     output_dir: str,
     body_name: str,
+    *,
+    layer_style: str = "default",
 ) -> str:
     """
     Full pipeline: project face → orient portrait → normalize → write DXF.
     Returns the path to the written DXF file.
     """
-    from projection import project_body_orthographic
+    from projection import collapse_closed_line_loops, project_body_orthographic
     from sheet_export import _orient_face_portrait
 
-    edge_data = project_body_orthographic(solid_cq_shape, face_index)
+    edge_data = project_body_orthographic(
+        solid_cq_shape,
+        face_index,
+        reference_mode="selected",
+    )
 
     # Orient portrait (U ≤ V) so the part's shorter dimension is always along X —
     # matching the orientation the sheet export and canvas use.
     edges = edge_data.get("edges", [])
     if edges:
         edges = _orient_face_portrait(edges)
+        edges = collapse_closed_line_loops(edges)
         edge_data = {**edge_data, "edges": edges}
 
     safe_name = _safe_filename(body_name)
     out_path = str(Path(output_dir) / f"{safe_name}.dxf")
 
-    edges_to_dxf(edge_data, out_path, body_name)
+    edges_to_dxf(edge_data, out_path, body_name, layer_style=layer_style)
 
     return out_path
 

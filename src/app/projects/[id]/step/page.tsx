@@ -17,13 +17,26 @@ const StepViewer3D = dynamic(
 );
 
 interface UploadResult {
-  session_id: string;
+  id: string;
+  filename: string;
+  sessionId: string;
+  selectedBodyIndex: number;
+  sortOrder: number;
+  bodyState: Array<{
+    bodyIndex: number;
+    name: string;
+    included: boolean;
+    confirmed: boolean;
+    selectedFaceIndex?: number;
+  }>;
   bodies: StepBody[];
 }
 
 interface SessionData {
+  stepFileId: string;
   sessionId: string;
   filename: string;
+  sortOrder: number;
   bodyStates: BodyState[];
   selectedFaceIndices: Record<number, number>;
   /** Projected face dimensions [l, w, t] in mm, keyed by body array index. */
@@ -31,12 +44,31 @@ interface SessionData {
   selectedBodyIdx: number;
 }
 
+interface StoredProjectStepFile {
+  id: string;
+  sessionId: string | null;
+  filename: string;
+  sortOrder: number;
+  selectedBodyIndex: number;
+  bodyState: Array<{
+    bodyIndex: number;
+    name: string;
+    included: boolean;
+    confirmed: boolean;
+    selectedFaceIndex?: number;
+  }>;
+}
+
+interface ProjectStepWorkspaceResponse {
+  units?: UnitSystem | null;
+  stepActiveFileId?: string | null;
+  stepFiles?: StoredProjectStepFile[];
+}
+
 export default function StepWorkspacePage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const STORAGE_KEY = `kerfuffle-step:${id}`;
 
   // ── Multi-session state ───────────────────────────────────────────────────
   const [sessions, setSessions] = useState<SessionData[]>([]);
@@ -51,11 +83,12 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
   const [projectUnits, setProjectUnits] = useState<UnitSystem>('in');
   const [units, setUnits] = useState<UnitSystem>('in');
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [addedCount, setAddedCount] = useState<number | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  const [restoring, setRestoring] = useState(false);
+  const [restoring, setRestoring] = useState(true);
 
   // ── Derived: active session ───────────────────────────────────────────────
   const activeSession = sessions[activeIdx] ?? null;
@@ -73,97 +106,144 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
     [activeIdx]
   );
 
-  // ── Restore from sessionStorage ───────────────────────────────────────────
-  useEffect(() => {
-    try {
-      const saved = sessionStorage.getItem(STORAGE_KEY);
-      if (!saved) return;
-      const { sessions: savedSessions, activeIdx: savedActiveIdx } = JSON.parse(saved) as {
-        sessions: {
-          sessionId: string;
-          filename: string;
-          bodyMeta: { name: string; included: boolean; confirmed: boolean }[];
-          selectedFaceIndices: Record<number, number>;
-          selectedBodyIdx: number;
-        }[];
-        activeIdx: number;
-      };
-      if (!savedSessions?.length) return;
-      setRestoring(true);
-      Promise.all(
-        savedSessions.map(async (s) => {
-          const r = await fetch(`/api/v1/step/${s.sessionId}/bodies`);
-          if (!r.ok) throw new Error('session gone');
-          const data = await r.json();
-          const bodies: StepBody[] = data.bodies;
-          return {
-            sessionId: s.sessionId,
-            filename: s.filename,
-            bodyStates: bodies.map((b, i) => ({
-              body: b,
-              name: s.bodyMeta[i]?.name ?? b.name,
-              included: s.bodyMeta[i]?.included ?? true,
-              confirmed: s.bodyMeta[i]?.confirmed ?? false,
-            })),
-            selectedFaceIndices: s.selectedFaceIndices ?? {},
-            faceDimsMap: {},
-            selectedBodyIdx: s.selectedBodyIdx ?? 0,
-          } as SessionData;
-        })
-      )
-        .then((restored) => {
-          setSessions(restored);
-          setActiveIdx(Math.min(savedActiveIdx ?? 0, restored.length - 1));
-        })
-        .catch(() => sessionStorage.removeItem(STORAGE_KEY))
-        .finally(() => setRestoring(false));
-    } catch {
-      // malformed — ignore
-    }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const fetchSessionBodies = useCallback(async (sessionId: string): Promise<StepBody[]> => {
+    const r = await fetch(`/api/v1/step/${sessionId}/bodies`);
+    if (!r.ok) throw new Error('session gone');
+    const data = await r.json();
+    return data.bodies as StepBody[];
+  }, []);
 
-  // ── Load the owning project's units for storage/optimizer consistency ────
+  const buildSessionFromBodies = useCallback((seed: StoredProjectStepFile, bodies: StepBody[]): SessionData => {
+    const selectedFaceIndices = Object.fromEntries(
+      bodies.flatMap((body, bodyArrayIndex) => {
+        const stored = seed.bodyState.find((entry) => entry.bodyIndex === body.index);
+        return typeof stored?.selectedFaceIndex === 'number'
+          ? [[bodyArrayIndex, stored.selectedFaceIndex]]
+          : [];
+      })
+    );
+
+    return {
+      stepFileId: seed.id,
+      sessionId: seed.sessionId ?? '',
+      filename: seed.filename,
+      sortOrder: seed.sortOrder ?? 0,
+      bodyStates: bodies.map((b) => {
+        const stored = seed.bodyState.find((entry) => entry.bodyIndex === b.index);
+        return {
+          body: b,
+          name: stored?.name ?? b.name,
+          included: stored?.included ?? true,
+          confirmed: stored?.confirmed ?? false,
+        };
+      }),
+      selectedFaceIndices,
+      faceDimsMap: {},
+      selectedBodyIdx: seed.selectedBodyIndex ?? 0,
+    };
+  }, []);
+
+  const serializeBodyState = useCallback((sessionData: SessionData) => (
+    sessionData.bodyStates.map((bs, bodyArrayIndex) => ({
+      bodyIndex: bs.body.index,
+      name: bs.name,
+      included: bs.included,
+      confirmed: bs.confirmed,
+      selectedFaceIndex: sessionData.selectedFaceIndices[bodyArrayIndex],
+    }))
+  ), []);
+
+  const persistWorkspaceToProject = useCallback(async (workspaceSessions: SessionData[], workspaceActiveIdx: number) => {
+    await Promise.all(
+      workspaceSessions.map((sessionData, index) =>
+        fetch(`/api/v1/projects/${id}/step-files/${sessionData.stepFileId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            selectedBodyIndex: sessionData.selectedBodyIdx,
+            sortOrder: index,
+            bodyState: serializeBodyState(sessionData),
+          }),
+        }).catch(() => null)
+      )
+    );
+
+    await fetch(`/api/v1/projects/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        stepActiveFileId: workspaceSessions[workspaceActiveIdx]?.stepFileId ?? null,
+      }),
+    }).catch(() => null);
+  }, [id, serializeBodyState]);
+
+  // ── Restore from the persisted project-backed STEP workspace ─────────────
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/v1/projects/${id}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        const nextUnits = (data?.units as UnitSystem | null) ?? 'in';
+
+    const restoreWorkspace = async () => {
+      setRestoring(true);
+      try {
+        const response = await fetch(`/api/v1/projects/${id}`);
+        if (!response.ok) {
+          if (response.status === 404) router.push('/dashboard');
+          return;
+        }
+        const data = await response.json() as ProjectStepWorkspaceResponse;
         if (cancelled) return;
+
+        const nextUnits = (data.units as UnitSystem | null) ?? 'in';
         setProjectUnits(nextUnits);
         setUnits(nextUnits);
-      })
-      .catch(() => {
-        // Fall back to inches if the project metadata can't be loaded.
-      });
+
+        const restoredSessions: SessionData[] = [];
+        for (const seed of [...(data.stepFiles ?? [])].sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))) {
+          if (!seed.sessionId) continue;
+          try {
+            const bodies = await fetchSessionBodies(seed.sessionId);
+            restoredSessions.push(buildSessionFromBodies(seed, bodies));
+          } catch {
+            // Skip missing/expired sessions and keep restoring the rest.
+          }
+        }
+
+        if (cancelled) return;
+
+        setSessions(restoredSessions);
+        if (restoredSessions.length === 0) {
+          setActiveIdx(0);
+          return;
+        }
+
+        const activeStepFileId = data.stepActiveFileId ?? null;
+        const restoredActiveIdx = activeStepFileId
+          ? restoredSessions.findIndex((sessionData) => sessionData.stepFileId === activeStepFileId)
+          : restoredSessions.length - 1;
+        setActiveIdx(
+          restoredActiveIdx >= 0 && restoredActiveIdx < restoredSessions.length
+            ? restoredActiveIdx
+            : restoredSessions.length - 1
+        );
+      } finally {
+        if (!cancelled) setRestoring(false);
+      }
+    };
+
+    void restoreWorkspace();
+
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [buildSessionFromBodies, fetchSessionBodies, id, router]);
 
-  // ── Persist whenever sessions change ─────────────────────────────────────
+  // ── Persist workspace changes back to the project ────────────────────────
   useEffect(() => {
-    if (sessions.length === 0) return;
-    try {
-      sessionStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({
-          sessions: sessions.map((s) => ({
-            sessionId: s.sessionId,
-            filename: s.filename,
-            bodyMeta: s.bodyStates.map((bs) => ({
-              name: bs.name,
-              included: bs.included,
-              confirmed: bs.confirmed,
-            })),
-            selectedFaceIndices: s.selectedFaceIndices,
-            selectedBodyIdx: s.selectedBodyIdx,
-          })),
-          activeIdx,
-        })
-      );
-    } catch { /* storage full */ }
-  }, [sessions, activeIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (restoring) return;
+    const timeout = window.setTimeout(() => {
+      void persistWorkspaceToProject(sessions, activeIdx);
+    }, 500);
+    return () => window.clearTimeout(timeout);
+  }, [activeIdx, persistWorkspaceToProject, restoring, sessions]);
 
   // ── Load mesh for active session (cached) ─────────────────────────────────
   useEffect(() => {
@@ -179,68 +259,141 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
   }, [activeSession?.sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Upload ────────────────────────────────────────────────────────────────
-  const handleFile = async (file: File) => {
-    if (!file.name.match(/\.(step|stp)$/i)) {
-      setUploadError('File must be a .step or .stp file');
+  const uploadSingleFile = useCallback(async (file: File): Promise<SessionData> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch(`/api/v1/projects/${id}/step-files`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail ?? `Upload failed (${res.status})`);
+    }
+    const data: UploadResult = await res.json();
+    return {
+      stepFileId: data.id,
+      sessionId: data.sessionId,
+      filename: data.filename,
+      sortOrder: data.sortOrder,
+      bodyStates: data.bodies.map((b) => {
+        const stored = data.bodyState.find((entry) => entry.bodyIndex === b.index);
+        return {
+          body: b,
+          name: stored?.name ?? b.name,
+          included: stored?.included ?? true,
+          confirmed: stored?.confirmed ?? false,
+        };
+      }),
+      selectedFaceIndices: Object.fromEntries(
+        (data.bodyState ?? [])
+          .filter((entry) => typeof entry.selectedFaceIndex === 'number')
+          .map((entry) => [entry.bodyIndex, entry.selectedFaceIndex as number])
+      ),
+      faceDimsMap: {},
+      selectedBodyIdx: data.selectedBodyIndex ?? 0,
+    };
+  }, [id]);
+
+  const handleFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+
+    const validFiles = files.filter((file) => file.name.match(/\.(step|stp)$/i));
+    const invalidFiles = files.filter((file) => !file.name.match(/\.(step|stp)$/i));
+
+    if (validFiles.length === 0) {
+      setUploadError('Files must be .step or .stp');
       return;
     }
+
     setUploading(true);
+    setUploadProgress(null);
     setUploadError(null);
     setAddedCount(null);
+
+    const uploadedSessions: SessionData[] = [];
+    const failedUploads: string[] = [];
+
     try {
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await fetch('/api/v1/step/upload', { method: 'POST', body: fd });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail ?? `Upload failed (${res.status})`);
+      for (const [index, file] of validFiles.entries()) {
+        setUploadProgress(
+          validFiles.length === 1
+            ? `Parsing ${file.name}…`
+            : `Parsing ${index + 1} of ${validFiles.length}: ${file.name}…`
+        );
+
+        try {
+          uploadedSessions.push(await uploadSingleFile(file));
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'Upload failed';
+          failedUploads.push(`${file.name} (${detail})`);
+        }
       }
-      const data: UploadResult = await res.json();
-      const newSession: SessionData = {
-        sessionId: data.session_id,
-        filename: file.name,
-        bodyStates: data.bodies.map((b) => ({ body: b, name: b.name, included: true, confirmed: false })),
-        selectedFaceIndices: {},
-        faceDimsMap: {},
-        selectedBodyIdx: 0,
-      };
-      setSessions((prev) => {
-        const next = [...prev, newSession];
-        setActiveIdx(next.length - 1);
-        return next;
-      });
-      setAddingNew(false);
-    } catch (e) {
-      setUploadError(e instanceof Error ? e.message : 'Upload failed');
+
+      if (uploadedSessions.length > 0) {
+        setSessions((prev) => {
+          const next = [...prev, ...uploadedSessions];
+          setActiveIdx(next.length - 1);
+          return next;
+        });
+        setAddingNew(false);
+      }
+
+      const issues: string[] = [];
+      if (invalidFiles.length > 0) {
+        const invalidNames = invalidFiles.map((file) => file.name).join(', ');
+        issues.push(`Skipped non-STEP files: ${invalidNames}`);
+      }
+      if (failedUploads.length > 0) {
+        issues.push(`Failed: ${failedUploads.join('; ')}`);
+      }
+
+      if (uploadedSessions.length === 0 && issues.length === 0) {
+        setUploadError('No files were uploaded');
+      } else if (issues.length > 0) {
+        setUploadError(issues.join('  '));
+      }
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
-  };
+  }, [uploadSingleFile]);
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) handleFile(file);
+    const files = Array.from(e.dataTransfer.files ?? []);
+    if (files.length > 0) void handleFiles(files);
   };
   const onFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) handleFile(file);
+    const files = Array.from(e.target.files ?? []);
+    if (files.length > 0) void handleFiles(files);
     e.target.value = ''; // allow re-selecting same file
   };
 
   // ── Remove a session tab ──────────────────────────────────────────────────
-  const handleRemoveSession = (idx: number) => {
-    setSessions((prev) => {
-      const next = prev.filter((_, i) => i !== idx);
-      if (next.length === 0) sessionStorage.removeItem(STORAGE_KEY);
-      setActiveIdx((prevActive) => {
-        if (prevActive > idx) return prevActive - 1;
-        if (prevActive === idx) return Math.max(0, idx - 1);
-        return prevActive;
+  const handleRemoveSession = async (idx: number) => {
+    const target = sessions[idx];
+    if (!target) return;
+
+    try {
+      const res = await fetch(`/api/v1/projects/${id}/step-files/${target.stepFileId}`, {
+        method: 'DELETE',
       });
-      return next;
-    });
+      if (!res.ok) {
+        const errorPayload = await res.json().catch(() => ({}));
+        throw new Error(errorPayload.detail ?? `Delete failed (${res.status})`);
+      }
+
+      setSessions((prev) => {
+        const next = prev.filter((_, i) => i !== idx);
+        setActiveIdx((prevActive) => {
+          if (prevActive > idx) return prevActive - 1;
+          if (prevActive === idx) return Math.max(0, idx - 1);
+          return prevActive;
+        });
+        return next;
+      });
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : 'Failed to remove STEP file');
+    }
   };
 
   // ── Face selection ────────────────────────────────────────────────────────
@@ -292,7 +445,7 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
     if (!activeSession) return;
     setAdding(true);
     try {
-      const { sessionId, bodyStates, selectedFaceIndices, faceDimsMap } = activeSession;
+      const { stepFileId, bodyStates, selectedFaceIndices, faceDimsMap } = activeSession;
       const toAdd = bodyStates.filter((bs) => bs.included && bs.confirmed);
       const cutsPayload = toAdd.map((bs) => {
         const bodyArrayIdx = bodyStates.indexOf(bs);
@@ -309,7 +462,7 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
           t: dims ? toProjectUnit(dims[2]) : 0,
           qty: 1,
           mat: '',
-          stepSessionId: sessionId,
+          stepFileId,
           stepBodyIndex: bs.body.index,
           stepFaceIndex: faceIdx,
         };
@@ -395,17 +548,17 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
         dragOver ? 'border-slate-500 bg-slate-50' : 'border-slate-300 hover:border-slate-400'
       }`}
     >
-      <input ref={fileInputRef} type="file" accept=".step,.stp" className="hidden" onChange={onFileInput} />
+      <input ref={fileInputRef} type="file" accept=".step,.stp" multiple className="hidden" onChange={onFileInput} />
       <svg className="w-12 h-12 mx-auto mb-4 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
           d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
       </svg>
       {uploading ? (
-        <p className="text-slate-600">Parsing STEP file…</p>
+        <p className="text-slate-600">{uploadProgress ?? 'Parsing STEP files…'}</p>
       ) : (
         <>
-          <p className="text-slate-700 font-medium">Drop a .step or .stp file here</p>
-          <p className="text-slate-400 text-sm mt-1">or click to browse</p>
+          <p className="text-slate-700 font-medium">Drop one or more .step or .stp files here</p>
+          <p className="text-slate-400 text-sm mt-1">or click to browse and select multiple</p>
         </>
       )}
       {uploadError && <p className="mt-3 text-red-600 text-sm">{uploadError}</p>}
@@ -494,7 +647,7 @@ export default function StepWorkspacePage({ params }: { params: Promise<{ id: st
                   ? 'bg-slate-800 text-white'
                   : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
               }`}
-              title="Load another STEP file"
+              title="Load one or more STEP files"
             >
               + STEP
             </button>

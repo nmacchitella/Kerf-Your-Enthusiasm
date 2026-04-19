@@ -22,7 +22,8 @@ from typing import Any, Dict, List
 import ezdxf
 from ezdxf.math import Vec2
 
-from projection import project_body_orthographic
+from projection import collapse_closed_line_loops, project_body_orthographic
+from vcarve_layers import map_layer_name, normalize_layer_style
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +213,20 @@ _LAYER_COLOR = {
 def _ensure_layer(doc: ezdxf.document.Drawing, layer_name: str) -> None:
     """Add layer to the document if it does not exist yet."""
     if layer_name not in doc.layers:
-        color = _LAYER_COLOR.get(layer_name, 5 if layer_name.startswith("DEPTH_") else 7)
+        if layer_name == "INTERIOR_OPENINGS":
+            color = 1
+        elif layer_name.startswith(("DEPTH_", "POCKET_")):
+            color = 5
+        else:
+            color = _LAYER_COLOR.get(layer_name, 7)
         doc.layers.add(layer_name, color=color)
 
 
-def _write_edge(msp, edge: Dict[str, Any], doc) -> None:
-    layer = edge.get("layer", "PROFILE")
+def _write_edge(msp, edge: Dict[str, Any], doc, *, layer_style: str = "default") -> None:
+    original_layer = edge.get("layer", "PROFILE")
+    layer = map_layer_name(original_layer, layer_style=layer_style)
     _ensure_layer(doc, layer)
-    color = _LAYER_COLOR.get(layer, 5 if layer.startswith("DEPTH_") else 7)
+    color = _LAYER_COLOR.get(original_layer, 5 if original_layer.startswith("DEPTH_") else 7)
     attribs = {"layer": layer, "color": color}
 
     if edge["type"] == "line":
@@ -242,7 +249,13 @@ def _write_edge(msp, edge: Dict[str, Any], doc) -> None:
     elif edge["type"] == "polyline":
         pts = [Vec2(p) for p in edge["points"]]
         if len(pts) >= 2:
-            msp.add_lwpolyline(pts, format="xy", dxfattribs=attribs)
+            is_closed = (
+                abs(pts[0].x - pts[-1].x) < 1e-6 and
+                abs(pts[0].y - pts[-1].y) < 1e-6
+            )
+            if is_closed:
+                pts[-1] = pts[0]
+            msp.add_lwpolyline(pts, format="xy", close=is_closed, dxfattribs=attribs)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +271,7 @@ def build_sheet_dxf(
     *,
     bodies_by_session: dict[str, list[dict]] | None = None,
     session_bodies: list[dict] | None = None,
+    layer_style: str = "default",
 ) -> ezdxf.document.Drawing:
     """
     Build a single-sheet DXF by projecting and placing each body.
@@ -285,6 +299,7 @@ def build_sheet_dxf(
     session_bodies    : flat body list — legacy single-session fallback
     """
     # Build a unified lookup: bodies_by_session takes priority
+    layer_style = normalize_layer_style(layer_style)
     if bodies_by_session is None:
         bodies_by_session = {"": session_bodies or []}
     doc = ezdxf.new("R2010")
@@ -293,15 +308,18 @@ def build_sheet_dxf(
     msp = doc.modelspace()
 
     # Add stock boundary
-    _ensure_layer(doc, "SHEET_BOUNDARY")
+    sheet_boundary_layer = map_layer_name("SHEET_BOUNDARY", layer_style=layer_style)
+    labels_layer = map_layer_name("LABELS", layer_style=layer_style)
+
+    _ensure_layer(doc, sheet_boundary_layer)
     msp.add_lwpolyline(
         [(0, 0), (sheet_width_mm, 0), (sheet_width_mm, sheet_length_mm), (0, sheet_length_mm)],
         format="xy",
         close=True,
-        dxfattribs={"layer": "SHEET_BOUNDARY", "color": 7},
+        dxfattribs={"layer": sheet_boundary_layer, "color": 7},
     )
 
-    _ensure_layer(doc, "LABELS")
+    _ensure_layer(doc, labels_layer)
 
     for placement in placements:
         body_index = placement["body_index"]
@@ -319,7 +337,11 @@ def build_sheet_dxf(
             continue
 
         try:
-            edge_data = project_body_orthographic(body["shape"], face_index)
+            edge_data = project_body_orthographic(
+                body["shape"],
+                face_index,
+                reference_mode="selected",
+            )
         except Exception:
             continue
 
@@ -376,6 +398,8 @@ def build_sheet_dxf(
                 renorm.append(ne2)
             normalized = renorm
 
+        normalized = collapse_closed_line_loops(normalized)
+
         # Apply rotation + translation.
         # 90° CW rotation (u,v)→(v,−u) maps the face's [0..face_w] u-range to
         # [−face_w..0], so we must offset y by face_w_mm to keep the part in
@@ -389,23 +413,24 @@ def build_sheet_dxf(
 
         # Write edges
         for e in placed:
-            _write_edge(msp, e, doc)
+            _write_edge(msp, e, doc, layer_style=layer_style)
 
         # Label: centered in the placed bounding box
         bu, bv, bu2, bv2 = _edge_bbox(placed)
         cx = (bu + bu2) / 2
         cy = (bv + bv2) / 2
         height = max(2.0, min((bu2 - bu) * 0.1, (bv2 - bv) * 0.1, 10.0))
-        _ensure_layer(doc, "LABELS")
+        _ensure_layer(doc, labels_layer)
         t = msp.add_text(
             body_name,
-            dxfattribs={"layer": "LABELS", "color": 8, "height": height},
+            dxfattribs={"layer": labels_layer, "color": 8, "height": height},
         )
         t.set_placement((cx, cy), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
 
     # ── Dimension-only cuts: draw as simple rectangles ─────────────────
-    _ensure_layer(doc, "PROFILE")
-    _ensure_layer(doc, "LABELS")
+    profile_layer = map_layer_name("PROFILE", layer_style=layer_style)
+    _ensure_layer(doc, profile_layer)
+    _ensure_layer(doc, labels_layer)
     for rp in (rect_placements or []):
         x0 = float(rp["x_mm"])
         y0 = float(rp["y_mm"])
@@ -416,13 +441,13 @@ def build_sheet_dxf(
             [(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)],
             format="xy",
             close=True,
-            dxfattribs={"layer": "PROFILE", "color": 7},
+            dxfattribs={"layer": profile_layer, "color": 7},
         )
         if name:
             text_h = max(2.0, min(w * 0.1, h * 0.1, 10.0))
             t = msp.add_text(
                 name,
-                dxfattribs={"layer": "LABELS", "color": 8, "height": text_h},
+                dxfattribs={"layer": labels_layer, "color": 8, "height": text_h},
             )
             t.set_placement((x0 + w / 2, y0 + h / 2), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
 
@@ -437,6 +462,7 @@ def build_sheet_preview(
     *,
     bodies_by_session: dict[str, list[dict]] | None = None,
     session_bodies: list[dict] | None = None,
+    layer_style: str = "default",
 ) -> dict:
     """
     Return JSON-serialisable edge data for an in-browser SVG preview of the
@@ -445,6 +471,7 @@ def build_sheet_preview(
 
     Returns { sheet_width_mm, sheet_length_mm, edges: [...] }
     """
+    layer_style = normalize_layer_style(layer_style)
     if bodies_by_session is None:
         bodies_by_session = {"": session_bodies or []}
 
@@ -457,7 +484,7 @@ def build_sheet_preview(
             [0, 0], [sheet_width_mm, 0],
             [sheet_width_mm, sheet_length_mm], [0, sheet_length_mm], [0, 0],
         ],
-        "layer": "SHEET_BOUNDARY",
+        "layer": map_layer_name("SHEET_BOUNDARY", layer_style=layer_style),
     })
 
     for placement in placements:
@@ -475,7 +502,11 @@ def build_sheet_preview(
             continue
 
         try:
-            edge_data = project_body_orthographic(body["shape"], face_index)
+            edge_data = project_body_orthographic(
+                body["shape"],
+                face_index,
+                reference_mode="selected",
+            )
         except Exception:
             continue
 
@@ -520,13 +551,17 @@ def build_sheet_preview(
                 renorm.append(ne2)
             normalized = renorm
 
+        normalized = collapse_closed_line_loops(normalized)
+
         if rot:
             _, _, face_w_mm, _ = _edge_bbox(normalized)
             y_adj = y_mm + face_w_mm
         else:
             y_adj = y_mm
         placed = [_translate_edge(e, x_mm, y_adj, rot) for e in normalized]
-        all_edges.extend(placed)
+        all_edges.extend(
+            [{**edge, "layer": map_layer_name(edge.get("layer"), layer_style=layer_style)} for edge in placed]
+        )
 
     # Dimension-only cuts: simple rectangles
     for rp in (rect_placements or []):
@@ -537,7 +572,7 @@ def build_sheet_preview(
         all_edges.append({
             "type": "polyline",
             "points": [[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h], [x0, y0]],
-            "layer": "PROFILE",
+            "layer": map_layer_name("PROFILE", layer_style=layer_style),
         })
 
     return {

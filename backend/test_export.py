@@ -97,8 +97,7 @@ with tempfile.TemporaryDirectory() as tmp:
     dxf_path = export_body_face(box, box_top_i, tmp, "box_top")
     msp1 = ezdxf.readfile(dxf_path).modelspace()
     lines1 = [e for e in msp1 if e.dxftype() == "LINE"]
-    # project_body_orthographic includes both top (PROFILE) and bottom (DEPTH) faces → 8 lines
-    check("box top face: 8 LINE entities (4 PROFILE + 4 DEPTH)", len(lines1) == 8, str(len(lines1)))
+    check("box top face: 4 LINE entities (PROFILE only)", len(lines1) == 4, str(len(lines1)))
 
     top_i = next(
         i for i in range(len(box_hole.Faces()))
@@ -110,7 +109,7 @@ with tempfile.TemporaryDirectory() as tmp:
     msp2 = ezdxf.readfile(export_body_face(box_hole, top_i, tmp, "hole_top")).modelspace()
     lines2 = [e for e in msp2 if e.dxftype() == "LINE"]
     circ2 = [e for e in msp2 if e.dxftype() in ("CIRCLE", "ARC", "LWPOLYLINE")]
-    check("box+hole top: 8 LINE entities", len(lines2) == 8, str(len(lines2)))
+    check("box+hole top: 4 LINE entities", len(lines2) == 4, str(len(lines2)))
     check("box+hole top: circular entity in HOLES", len(circ2) > 0)
 
 

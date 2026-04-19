@@ -65,6 +65,11 @@ export const projects = sqliteTable('projects', {
   kerf: real('kerf').notNull().default(0.125),
   units: text('units').default('in'),
   groupMultipliers: text('group_multipliers').default('{}'),
+  layoutOverrides: text('layout_overrides').default('{}'),
+  layoutExcludedKeys: text('layout_excluded_keys').default('[]'),
+  layoutPadding: real('layout_padding').default(0.5),
+  layoutHasActive: integer('layout_has_active', { mode: 'boolean' }).default(false),
+  stepActiveFileId: text('step_active_file_id'),
   isPublic: integer('is_public', { mode: 'boolean' }).default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
@@ -94,10 +99,26 @@ export const cuts = sqliteTable('cuts', {
   quantity: integer('quantity').notNull().default(1),
   material: text('material').default(''),
   groupName: text('group_name').default(''),
+  stepFileId: text('step_file_id'),
   stepSessionId: text('step_session_id'),
   stepBodyIndex: integer('step_body_index'),
   stepFaceIndex: integer('step_face_index'),
   sortOrder: integer('sort_order').default(0),
+});
+
+// Persisted STEP files stored on disk and linked to a project
+export const projectStepFiles = sqliteTable('project_step_files', {
+  id: text('id').primaryKey().$defaultFn(() => crypto.randomUUID()),
+  projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+  filename: text('filename').notNull(),
+  storagePath: text('storage_path').notNull(),
+  fileHash: text('file_hash').default(''),
+  fileSize: integer('file_size').default(0),
+  bodyState: text('body_state').default('[]'),
+  selectedBodyIndex: integer('selected_body_index').default(0),
+  sortOrder: integer('sort_order').default(0),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
 });
 
 // Tools: Personal inventory + community catalog
@@ -138,6 +159,7 @@ export const projectsRelations = relations(projects, ({ one, many }) => ({
   user: one(users, { fields: [projects.userId], references: [users.id] }),
   stocks: many(stocks),
   cuts: many(cuts),
+  stepFiles: many(projectStepFiles),
 }));
 
 export const stocksRelations = relations(stocks, ({ one }) => ({
@@ -146,6 +168,10 @@ export const stocksRelations = relations(stocks, ({ one }) => ({
 
 export const cutsRelations = relations(cuts, ({ one }) => ({
   project: one(projects, { fields: [cuts.projectId], references: [projects.id] }),
+}));
+
+export const projectStepFilesRelations = relations(projectStepFiles, ({ one }) => ({
+  project: one(projects, { fields: [projectStepFiles.projectId], references: [projects.id] }),
 }));
 
 export const toolsRelations = relations(tools, ({ one }) => ({
@@ -168,5 +194,7 @@ export type Stock = typeof stocks.$inferSelect;
 export type NewStock = typeof stocks.$inferInsert;
 export type Cut = typeof cuts.$inferSelect;
 export type NewCut = typeof cuts.$inferInsert;
+export type ProjectStepFile = typeof projectStepFiles.$inferSelect;
+export type NewProjectStepFile = typeof projectStepFiles.$inferInsert;
 export type Tool = typeof tools.$inferSelect;
 export type NewTool = typeof tools.$inferInsert;

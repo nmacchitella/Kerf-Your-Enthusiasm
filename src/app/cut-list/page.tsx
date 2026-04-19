@@ -24,6 +24,7 @@ export default function CutListPage() {
     { id: 3, label: 'Top', l: 48, w: 24, t: 0, qty: 1, mat: '' },
   ]);
   const [kerf, setKerf] = useState(0.125);
+  const [sheetEdgePadding, setSheetEdgePadding] = useState(0);
   const [showAdv, setShowAdv] = useState(false);
   const [result, setResult] = useState<OptimizationResult | null>(null);
   const [showLabels, setShowLabels] = useState(true);
@@ -413,6 +414,37 @@ export default function CutListPage() {
               </div>
             </div>
           </div>
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <label className="text-slate-500 block mb-1">Sheet Border Padding</label>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  step="0.0625"
+                  min={0}
+                  value={sheetEdgePadding}
+                  onChange={(e) => setSheetEdgePadding(parseFloat(e.target.value) || 0)}
+                  className="bg-slate-50 border border-slate-200 rounded px-2 py-1.5 w-16 focus:border-slate-400 outline-none text-slate-800"
+                />
+                <span className="text-slate-400 text-[10px]">in</span>
+              </div>
+              <div className="text-[10px] text-slate-400 mt-1">Keeps the outer edge clear for hold-downs.</div>
+            </div>
+            <div>
+              <label className="text-slate-500 block mb-1">Presets</label>
+              <div className="flex gap-1 flex-wrap">
+                {[{ label: 'None', value: 0 }, { label: '1/4"', value: 0.25 }, { label: '1/2"', value: 0.5 }, { label: '3/4"', value: 0.75 }, { label: '1"', value: 1 }].map((p) => (
+                  <button
+                    key={p.value}
+                    onClick={() => setSheetEdgePadding(p.value)}
+                    className={`px-2 py-1.5 rounded text-[10px] ${sheetEdgePadding === p.value ? 'bg-slate-700 text-white' : 'text-slate-500 hover:text-slate-700 border border-slate-200'}`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
           <div className="flex gap-4 text-xs pt-1">
             <label className="flex items-center gap-2 text-slate-500 cursor-pointer">
               <input type="checkbox" checked={showAdv} onChange={(e) => setShowAdv(e.target.checked)} className="w-3 h-3 accent-slate-600" />
@@ -498,7 +530,7 @@ export default function CutListPage() {
         {/* Optimize */}
         <div>
           <button
-            onClick={() => setResult(optimizeCutsBest(stocks, cuts, kerf))}
+            onClick={() => setResult(optimizeCutsBest(stocks, cuts, kerf, 0, [], [], sheetEdgePadding))}
             className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 text-white font-medium rounded text-sm transition-colors"
           >
             Optimize Cut Layout
@@ -629,7 +661,7 @@ export default function CutListPage() {
                 <div key={i} className="bg-white rounded-md p-3 shadow-sm border border-slate-200 inline-block">
                   <div className="flex justify-between text-xs text-slate-500 mb-2">
                     <span>Sheet {i + 1}</span>
-                    <span>{sheet.name} {sheet.w}"×{sheet.l}"</span>
+                    <span>{sheet.name} {sheet.w}&quot;×{sheet.l}&quot;</span>
                   </div>
                   <svg
                     viewBox={`0 0 ${vw} ${vh}`}
@@ -672,7 +704,7 @@ export default function CutListPage() {
                           )}
                           {isHovered && (
                             <text x={cx + cw / 2} y={cy + ch / 2 + Math.max(Math.min(cw, ch) / 4, 2) + 1} textAnchor="middle" dominantBaseline="middle" fill="white" fontSize={Math.max(Math.min(cw, ch) / 5, 1.5)} fontWeight="400">
-                              {l}" × {w}"
+                              {l}&quot; × {w}&quot;
                             </text>
                           )}
                         </g>
@@ -700,8 +732,8 @@ export default function CutListPage() {
                       return (
                         <tr key={j} className="border-t border-slate-100">
                           <td className="py-0.5 text-red-500">{p.label}</td>
-                          <td className="py-0.5 text-right text-slate-500">{l}"</td>
-                          <td className="py-0.5 text-right text-slate-500">{w}"</td>
+                          <td className="py-0.5 text-right text-slate-500">{l}&quot;</td>
+                          <td className="py-0.5 text-right text-slate-500">{w}&quot;</td>
                         </tr>
                       );
                     })}
